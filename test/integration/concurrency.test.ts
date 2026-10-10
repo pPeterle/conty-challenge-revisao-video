@@ -52,6 +52,19 @@ describe("concorrência", () => {
     expect(events.filter((e) => e.type === "delivery.approved")).toHaveLength(1);
   });
 
+  it("aprovações simultâneas da versão nova numa entrega desfeita reaprovam uma vez só", async () => {
+    const t = setup();
+    const d = await t.delivery(["video"]);
+    await t.submitAndApprove(d.id, "video");
+    await t.call("POST", `/deliveries/${d.id}/approve`);
+    const v2 = await t.submit(d.id, "video");
+    const results = await Promise.all(Array.from({ length: 25 }, () => t.call("POST", `/versions/${v2.body.version.id}/approve`)));
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    const events = (await t.call("GET", `/deliveries/${d.id}/events`)).body as { type: string; round: number }[];
+    expect(events.filter((e) => e.type === "delivery.approved").map((e) => e.round)).toEqual([1, 2]);
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
+  });
+
   it("envios simultâneos na mesma peça recebem números de versão distintos e contíguos", async () => {
     const t = setup();
     const d = await t.delivery(["video"]);

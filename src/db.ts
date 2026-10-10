@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS piece_versions (
   UNIQUE (delivery_id, piece_type, number)
 );
 
+-- Peça não exigida que recebeu versão nova com a entrega aprovada passa a bloquear a reaprovação.
+CREATE TABLE IF NOT EXISTS delivery_changed_pieces (
+  delivery_id TEXT NOT NULL REFERENCES deliveries(id),
+  piece_type  TEXT NOT NULL REFERENCES piece_types(code),
+  created_at  TEXT NOT NULL,
+  PRIMARY KEY (delivery_id, piece_type)
+);
+
 CREATE TABLE IF NOT EXISTS comments (
   id         TEXT PRIMARY KEY,
   version_id TEXT NOT NULL REFERENCES piece_versions(id),
@@ -135,6 +143,11 @@ export interface EventRow {
   created_at: string;
 }
 
+export interface Page {
+  limit: number;
+  offset: number;
+}
+
 export function openDatabase(path: string): DatabaseSync {
   if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
@@ -214,6 +227,25 @@ export class Repository {
       | undefined;
   }
 
+  markPieceChangedAfterApproval(deliveryId: string, pieceType: string, at: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO delivery_changed_pieces (delivery_id, piece_type, created_at) VALUES (?, ?, ?)
+         ON CONFLICT (delivery_id, piece_type) DO NOTHING`,
+      )
+      .run(deliveryId, pieceType, at);
+  }
+
+  piecesChangedAfterApproval(deliveryId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.piece_type FROM delivery_changed_pieces c JOIN piece_types t ON t.code = c.piece_type
+         WHERE c.delivery_id = ? ORDER BY t.rowid`,
+      )
+      .all(deliveryId) as { piece_type: string }[];
+    return rows.map((r) => r.piece_type);
+  }
+
   markDeliveryApproved(id: string, round: number, at: string): void {
     this.db
       .prepare("UPDATE deliveries SET status = 'aprovada', approval_round = ?, approved_at = ? WHERE id = ?")
@@ -282,10 +314,10 @@ export class Repository {
     return new Map(rows.map((r) => [r.piece_type, r.n]));
   }
 
-  listVersions(deliveryId: string, pieceType: string): VersionRow[] {
+  listVersions(deliveryId: string, pieceType: string, page: Page): VersionRow[] {
     return this.db
-      .prepare("SELECT * FROM piece_versions WHERE delivery_id = ? AND piece_type = ? ORDER BY number")
-      .all(deliveryId, pieceType) as unknown as VersionRow[];
+      .prepare("SELECT * FROM piece_versions WHERE delivery_id = ? AND piece_type = ? ORDER BY number LIMIT ? OFFSET ?")
+      .all(deliveryId, pieceType, page.limit, page.offset) as unknown as VersionRow[];
   }
 
   setVersionReview(id: string, status: VersionStatus, note: string | null, at: string): void {
@@ -300,10 +332,10 @@ export class Repository {
       .run(c.id, c.version_id, c.author, c.body, c.at_second, c.created_at);
   }
 
-  listComments(versionId: string): CommentRow[] {
+  listComments(versionId: string, page: Page): CommentRow[] {
     return this.db
-      .prepare("SELECT * FROM comments WHERE version_id = ? ORDER BY at_second, created_at, rowid")
-      .all(versionId) as unknown as CommentRow[];
+      .prepare("SELECT * FROM comments WHERE version_id = ? ORDER BY at_second, created_at, rowid LIMIT ? OFFSET ?")
+      .all(versionId, page.limit, page.offset) as unknown as CommentRow[];
   }
 
   insertEvent(e: Omit<EventRow, "id">): void {
@@ -312,9 +344,9 @@ export class Repository {
       .run(e.delivery_id, e.type, e.round, e.payload, e.created_at);
   }
 
-  listEvents(deliveryId: string): EventRow[] {
+  listEvents(deliveryId: string, page: Page): EventRow[] {
     return this.db
-      .prepare("SELECT * FROM delivery_events WHERE delivery_id = ? ORDER BY id")
-      .all(deliveryId) as unknown as EventRow[];
+      .prepare("SELECT * FROM delivery_events WHERE delivery_id = ? ORDER BY id LIMIT ? OFFSET ?")
+      .all(deliveryId, page.limit, page.offset) as unknown as EventRow[];
   }
 }

@@ -51,16 +51,17 @@ describe("regra de peças exigidas", () => {
     expect(res.status).toBe(422);
     expect(res.body.error.code).toBe("pecas_pendentes");
     expect(res.body.error.message).toBe(
-      "A entrega não pode ser aprovada. Peças exigidas pendentes: roteiro: nenhuma versão enviada; capa: versão atual v1 com alteração solicitada; legenda: versão atual v1 em revisão.",
+      "A entrega não pode ser aprovada. Peças pendentes: roteiro: nenhuma versão enviada; capa: versão atual v1 com alteração solicitada; legenda: versão atual v1 em revisão.",
     );
     expect(res.body.error.details.pending).toEqual([
-      { piece_type: "roteiro", reason: "sem_versao" },
+      { piece_type: "roteiro", required: true, reason: "sem_versao" },
       {
         piece_type: "capa",
+        required: true,
         reason: "versao_atual_nao_aprovada",
         current_version: { id: capa.body.version.id, number: 1, status: "alteracao_solicitada" },
       },
-      { piece_type: "legenda", reason: "versao_atual_nao_aprovada", current_version: expect.objectContaining({ number: 1, status: "em_revisao" }) },
+      { piece_type: "legenda", required: true, reason: "versao_atual_nao_aprovada", current_version: expect.objectContaining({ number: 1, status: "em_revisao" }) },
     ]);
 
     const after = await t.call("GET", `/deliveries/${d.id}`);
@@ -96,7 +97,7 @@ describe("regra de peças exigidas", () => {
   it("campanha só de vídeo não exige roteiro", async () => {
     const t = setup();
     const d = await t.delivery(["video"]);
-    expect(d.pending).toEqual([{ piece_type: "video", reason: "sem_versao" }]);
+    expect(d.pending).toEqual([{ piece_type: "video", required: true, reason: "sem_versao" }]);
     await t.submitAndApprove(d.id, "video");
     const res = await t.call("POST", `/deliveries/${d.id}/approve`);
     expect(res.status).toBe(200);
@@ -196,7 +197,7 @@ describe("versões", () => {
 });
 
 describe("entrega aprovada que recebe versão nova", () => {
-  it("versão nova numa peça exigida desfaz a aprovação até ser aprovada e reaprovada", async () => {
+  it("versão nova numa peça desfaz a aprovação até a nova versão ser aprovada", async () => {
     const t = setup();
     const d = await t.delivery(["video", "capa"]);
     await t.submitAndApprove(d.id, "video");
@@ -211,35 +212,94 @@ describe("entrega aprovada que recebe versão nova", () => {
     const blocked = await t.call("POST", `/deliveries/${d.id}/approve`);
     expect(blocked.status).toBe(422);
     expect(blocked.body.error.details.pending).toEqual([
-      { piece_type: "video", reason: "versao_atual_nao_aprovada", current_version: { id: v2.body.version.id, number: 2, status: "em_revisao" } },
+      {
+        piece_type: "video",
+        required: true,
+        reason: "versao_atual_nao_aprovada",
+        current_version: { id: v2.body.version.id, number: 2, status: "em_revisao" },
+      },
     ]);
 
+    // Aprovar a versão nova basta: a entrega volta a aprovada sozinha, numa rodada nova.
     await t.call("POST", `/versions/${v2.body.version.id}/approve`);
-    const stillNot = await t.call("GET", `/deliveries/${d.id}`);
-    expect(stillNot.body).toMatchObject({ status: "em_producao", ready_to_approve: true });
+    const back = await t.call("GET", `/deliveries/${d.id}`);
+    expect(back.body).toMatchObject({ status: "aprovada", payable: true, approval_round: 2 });
 
-    const reapproved = await t.call("POST", `/deliveries/${d.id}/approve`);
-    expect(reapproved.status).toBe(200);
-    expect(reapproved.body.delivery).toMatchObject({ status: "aprovada", payable: true, approval_round: 2 });
+    const again = await t.call("POST", `/deliveries/${d.id}/approve`);
+    expect(again.body.already_approved).toBe(true);
 
-    const events = (await t.call("GET", `/deliveries/${d.id}/events`)).body as { type: string; round: number | null; payload: { version_id?: string } }[];
+    const events = (await t.call("GET", `/deliveries/${d.id}/events`)).body as {
+      type: string;
+      round: number | null;
+      payload: { version_id?: string; automatic?: boolean };
+    }[];
     const lifecycle = events.filter((e) => e.type.startsWith("delivery."));
-    expect(lifecycle.map((e) => [e.type, e.round])).toEqual([
-      ["delivery.approved", 1],
-      ["delivery.approval_revoked", 1],
-      ["delivery.approved", 2],
+    expect(lifecycle.map((e) => [e.type, e.round, e.payload.automatic])).toEqual([
+      ["delivery.approved", 1, false],
+      ["delivery.approval_revoked", 1, undefined],
+      ["delivery.approved", 2, true],
     ]);
     expect(lifecycle[1].payload.version_id).toBe(v2.body.version.id);
   });
 
-  it("versão nova em peça não exigida não desfaz a aprovação", async () => {
+  it("com mais de uma peça alterada, a reaprovação só acontece quando a última é aprovada", async () => {
+    const t = setup();
+    const d = await t.delivery(["video", "capa"]);
+    await t.submitAndApprove(d.id, "video");
+    await t.submitAndApprove(d.id, "capa");
+    await t.call("POST", `/deliveries/${d.id}/approve`);
+
+    const video2 = await t.submit(d.id, "video");
+    const capa2 = await t.submit(d.id, "capa");
+    await t.call("POST", `/versions/${video2.body.version.id}/approve`);
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body.status).toBe("em_producao");
+    await t.call("POST", `/versions/${capa2.body.version.id}/approve`);
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
+  });
+
+  it("alteração solicitada na versão nova mantém a entrega em produção", async () => {
     const t = setup();
     const d = await t.delivery(["video"]);
     await t.submitAndApprove(d.id, "video");
     await t.call("POST", `/deliveries/${d.id}/approve`);
+    const v2 = await t.submit(d.id, "video");
+    await t.call("POST", `/versions/${v2.body.version.id}/request-changes`, { note: "voltar o corte antigo" });
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body.status).toBe("em_producao");
+    await t.submitAndApprove(d.id, "video");
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
+  });
+
+  it("versão nova em peça não exigida também desfaz a aprovação e passa a bloquear até ser aprovada", async () => {
+    const t = setup();
+    const d = await t.delivery(["video"]);
+    await t.submitAndApprove(d.id, "video");
+    await t.call("POST", `/deliveries/${d.id}/approve`);
+
     const extra = await t.submit(d.id, "legenda");
-    expect(extra.body.approval_revoked).toBe(false);
-    expect(extra.body.delivery.status).toBe("aprovada");
+    expect(extra.body.approval_revoked).toBe(true);
+    expect(extra.body.delivery).toMatchObject({ status: "em_producao", payable: false, blocking_pieces: ["video", "legenda"] });
+
+    const blocked = await t.call("POST", `/deliveries/${d.id}/approve`);
+    expect(blocked.status).toBe(422);
+    expect(blocked.body.error.details.pending).toEqual([
+      {
+        piece_type: "legenda",
+        required: false,
+        reason: "versao_atual_nao_aprovada",
+        current_version: { id: extra.body.version.id, number: 1, status: "em_revisao" },
+      },
+    ]);
+    expect(blocked.body.error.message).toContain("legenda (não exigida, mudou depois da aprovação)");
+
+    await t.call("POST", `/versions/${extra.body.version.id}/approve`);
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
+  });
+
+  it("primeira aprovação continua explícita: aprovar a última peça não aprova a entrega sozinha", async () => {
+    const t = setup();
+    const d = await t.delivery(["video"]);
+    await t.submitAndApprove(d.id, "video");
+    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "em_producao", ready_to_approve: true });
   });
 });
 

@@ -1,17 +1,20 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
 import type { Clock } from "./clock.ts";
-import { Repository, transaction, type CommentRow, type DeliveryRow, type EventRow, type VersionRow } from "./db.ts";
+import { Repository, transaction, type Page, type CommentRow, type DeliveryRow, type EventRow, type VersionRow } from "./db.ts";
 import {
+  blockingPieces,
   describePending,
   isValidAtSecond,
   pendingPieces,
   reviewTransition,
+  shouldAutoReapprove,
   submissionRevokesApproval,
   type CurrentVersion,
   type ReviewDecision,
 } from "./domain.ts";
 import { AppError, notFound, validation } from "./errors.ts";
+import { LIMITS, type NewCampaign, type NewComment, type NewVersion } from "./schemas.ts";
 
 export interface ServiceDeps {
   db: DatabaseSync;
@@ -19,22 +22,7 @@ export interface ServiceDeps {
   newId?: () => string;
 }
 
-export interface NewCampaign {
-  name: string;
-  required_pieces: string[];
-}
-
-export interface NewVersion {
-  url?: string;
-  file_name?: string;
-  duration_seconds?: number;
-}
-
-export interface NewComment {
-  author: string;
-  body: string;
-  at_second?: number;
-}
+export const DEFAULT_PAGE: Page = { limit: LIMITS.pageDefault, offset: 0 };
 
 export class ReviewService {
   private readonly repo: Repository;
@@ -92,22 +80,22 @@ export class ReviewService {
     return this.versionView(version);
   }
 
-  listVersions(deliveryId: string, pieceType: string) {
+  listVersions(deliveryId: string, pieceType: string, page: Page = DEFAULT_PAGE) {
     if (!this.repo.getDelivery(deliveryId)) throw notFound("Entrega");
     this.assertKnownPiece(pieceType);
-    const versions = this.repo.listVersions(deliveryId, pieceType);
-    const currentNumber = versions.at(-1)?.number;
+    const versions = this.repo.listVersions(deliveryId, pieceType, page);
+    const currentNumber = this.repo.currentVersion(deliveryId, pieceType)?.number;
     return versions.map((v) => toVersionJson(v, v.number === currentNumber));
   }
 
-  listComments(versionId: string) {
+  listComments(versionId: string, page: Page = DEFAULT_PAGE) {
     if (!this.repo.getVersion(versionId)) throw notFound("Versão");
-    return this.repo.listComments(versionId).map(toCommentJson);
+    return this.repo.listComments(versionId, page).map(toCommentJson);
   }
 
-  listEvents(deliveryId: string) {
+  listEvents(deliveryId: string, page: Page = DEFAULT_PAGE) {
     if (!this.repo.getDelivery(deliveryId)) throw notFound("Entrega");
-    return this.repo.listEvents(deliveryId).map(toEventJson);
+    return this.repo.listEvents(deliveryId, page).map(toEventJson);
   }
 
   // ---------- escrita ----------
@@ -175,13 +163,15 @@ export class ReviewService {
         number: version.number,
       });
 
-      const required = this.repo.requiredPieces(delivery.campaign_id);
-      const revoked = submissionRevokesApproval(delivery.status, pieceType, required);
+      const revoked = submissionRevokesApproval(delivery.status);
       if (revoked) {
+        const required = this.repo.requiredPieces(delivery.campaign_id).includes(pieceType);
+        if (!required) this.repo.markPieceChangedAfterApproval(delivery.id, pieceType, now);
         this.repo.markDeliveryInProduction(delivery.id);
         this.event(delivery.id, "delivery.approval_revoked", delivery.approval_round, {
           reason: "nova_versao",
           piece_type: pieceType,
+          required,
           version_id: version.id,
           number: version.number,
         });
@@ -231,6 +221,7 @@ export class ReviewService {
           number: version.number,
           ...(note ? { note } : {}),
         });
+        if (decision === "aprovada") this.reapproveIfResolved(version.delivery_id);
       }
       return this.versionView(this.repo.getVersion(version.id)!);
     });
@@ -277,19 +268,40 @@ export class ReviewService {
       if (!delivery) throw notFound("Entrega");
       if (delivery.status === "aprovada") return { already_approved: true, delivery: this.deliveryView(delivery) };
 
-      const required = this.repo.requiredPieces(delivery.campaign_id);
-      const current = this.currentByPiece(delivery.id);
-      const pending = pendingPieces(required, current);
+      const { pending } = this.evaluate(delivery);
       if (pending.length > 0) {
         throw new AppError(422, "pecas_pendentes", describePending(pending), { pending });
       }
-
-      const round = delivery.approval_round + 1;
-      this.repo.markDeliveryApproved(delivery.id, round, this.now());
-      this.event(delivery.id, "delivery.approved", round, {
-        versions: required.map((p) => ({ piece_type: p, version_id: current.get(p)!.id, number: current.get(p)!.number })),
-      });
+      this.markApproved(delivery, false);
       return { already_approved: false, delivery: this.deliveryView(this.repo.getDelivery(delivery.id)!) };
+    });
+  }
+
+  /** Chamada dentro da transação que aprovou uma versão. */
+  private reapproveIfResolved(deliveryId: string) {
+    const delivery = this.repo.getDelivery(deliveryId)!;
+    const { pending } = this.evaluate(delivery);
+    if (shouldAutoReapprove(delivery.status, delivery.approval_round, pending)) this.markApproved(delivery, true);
+  }
+
+  private evaluate(delivery: DeliveryRow) {
+    const required = this.repo.requiredPieces(delivery.campaign_id);
+    const changed = this.repo.piecesChangedAfterApproval(delivery.id);
+    const current = this.currentByPiece(delivery.id);
+    return { required, changed, current, pending: pendingPieces(required, changed, current) };
+  }
+
+  private markApproved(delivery: DeliveryRow, automatic: boolean) {
+    const { required, changed, current } = this.evaluate(delivery);
+    const round = delivery.approval_round + 1;
+    this.repo.markDeliveryApproved(delivery.id, round, this.now());
+    this.event(delivery.id, "delivery.approved", round, {
+      automatic,
+      versions: blockingPieces(required, changed).map((p) => ({
+        piece_type: p,
+        version_id: current.get(p)!.id,
+        number: current.get(p)!.number,
+      })),
     });
   }
 
@@ -315,11 +327,10 @@ export class ReviewService {
   }
 
   private deliveryView(delivery: DeliveryRow) {
-    const required = this.repo.requiredPieces(delivery.campaign_id);
-    const current = this.currentByPiece(delivery.id);
+    const { required, changed, current, pending } = this.evaluate(delivery);
+    const blocking = blockingPieces(required, changed);
     const counts = this.repo.versionCounts(delivery.id);
-    const pieceTypes = [...required, ...[...current.keys()].filter((p) => !required.includes(p)).sort()];
-    const pending = pendingPieces(required, current);
+    const pieceTypes = [...blocking, ...[...current.keys()].filter((p) => !blocking.includes(p)).sort()];
     return {
       id: delivery.id,
       campaign_id: delivery.campaign_id,
@@ -330,6 +341,7 @@ export class ReviewService {
       approved_at: delivery.approved_at,
       created_at: delivery.created_at,
       required_pieces: required,
+      blocking_pieces: blocking,
       ready_to_approve: pending.length === 0,
       pending,
       pieces: pieceTypes.map((p) => {
@@ -337,6 +349,7 @@ export class ReviewService {
         return {
           piece_type: p,
           required: required.includes(p),
+          blocking: blocking.includes(p),
           versions_count: counts.get(p) ?? 0,
           current_version: v ? toVersionJson(v, true) : null,
         };
