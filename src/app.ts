@@ -14,6 +14,7 @@ import {
   pageQuery,
   pieceParam,
   requestChangesSchema,
+  requireJson,
   validate,
 } from "./schemas.ts";
 import { ReviewService } from "./service.ts";
@@ -56,13 +57,13 @@ export function createApp(deps: AppDeps) {
 
   app.get("/piece-types", (c) => c.json(service.pieceTypes()));
 
-  app.post("/campaigns", validate("json", newCampaignSchema), (c) =>
+  app.post("/campaigns", requireJson(), validate("json", newCampaignSchema), (c) =>
     c.json(service.createCampaign(c.req.valid("json")), 201),
   );
 
   app.get("/campaigns/:id", validate("param", idParam), (c) => c.json(service.getCampaign(c.req.valid("param").id)));
 
-  app.post("/campaigns/:id/deliveries", validate("param", idParam), validate("json", newDeliverySchema), (c) => {
+  app.post("/campaigns/:id/deliveries", validate("param", idParam), requireJson(), validate("json", newDeliverySchema), (c) => {
     const result = service.createDelivery(c.req.valid("param").id, c.req.valid("json").creator_id);
     return c.json(result.delivery, result.created ? 201 : 200);
   });
@@ -80,6 +81,7 @@ export function createApp(deps: AppDeps) {
   app.post(
     "/deliveries/:id/pieces/:pieceType/versions",
     validate("param", pieceParam),
+    requireJson(),
     validate("json", newVersionSchema),
     (c) => {
       const { id, pieceType } = c.req.valid("param");
@@ -98,11 +100,11 @@ export function createApp(deps: AppDeps) {
     c.json(service.approveVersion(c.req.valid("param").id)),
   );
 
-  app.post("/versions/:id/request-changes", validate("param", idParam), validate("json", requestChangesSchema), (c) =>
+  app.post("/versions/:id/request-changes", validate("param", idParam), requireJson({ bodyOptional: true }), validate("json", requestChangesSchema), (c) =>
     c.json(service.requestChanges(c.req.valid("param").id, c.req.valid("json").note ?? null)),
   );
 
-  app.post("/versions/:id/comments", validate("param", idParam), validate("json", newCommentSchema), (c) =>
+  app.post("/versions/:id/comments", validate("param", idParam), requireJson(), validate("json", newCommentSchema), (c) =>
     c.json(service.addComment(c.req.valid("param").id, c.req.valid("json")), 201),
   );
 

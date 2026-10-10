@@ -1,7 +1,7 @@
 // Todo dado que vem do cliente (corpo, params, query) passa por um destes schemas.
 // Objetos usam strip: campo desconhecido é descartado sem erro.
 import { zValidator } from "@hono/zod-validator";
-import type { ValidationTargets } from "hono";
+import type { MiddlewareHandler, ValidationTargets } from "hono";
 import { z } from "zod";
 import { AppError } from "./errors.ts";
 
@@ -118,6 +118,21 @@ export type NewComment = z.infer<typeof newCommentSchema>;
 export const requestChangesSchema = z.object({ note: optionalText(2000) });
 
 // ---------- validador ----------
+
+const JSON_CONTENT_TYPE = /^application\/([a-z-.]+\+)?json(\s*;.*)?$/i;
+
+/**
+ * Rota com corpo exige Content-Type JSON (415 se ausente ou outro). Em rota de corpo opcional,
+ * requisição sem corpo nenhum passa.
+ */
+export function requireJson(options: { bodyOptional?: boolean } = {}): MiddlewareHandler {
+  return async (c, next) => {
+    const contentType = c.req.header("content-type");
+    if (contentType && JSON_CONTENT_TYPE.test(contentType)) return next();
+    if (options.bodyOptional && (await c.req.text()) === "") return next();
+    throw new AppError(415, "content_type_invalido", "Envie o corpo como JSON, com Content-Type: application/json.");
+  };
+}
 
 export function toValidationError(error: z.ZodError): AppError {
   const issues = error.issues.map((i) => ({ path: i.path.join(".") || "(corpo)", message: i.message }));

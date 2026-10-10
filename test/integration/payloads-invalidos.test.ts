@@ -164,14 +164,26 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     expect(res.json).not.toHaveProperty("admin");
   });
 
-  it("sem Content-Type application/json o corpo não é lido, e o que é obrigatório falta (400)", async () => {
-    const t = setup();
+  it.each(ENDPOINTS)("%s sem Content-Type JSON devolve 415", async (_name, path) => {
+    const f = await fixture();
     const body = JSON.stringify({ name: "x", required_pieces: ["video"] });
-    for (const contentType of [null, "text/plain", "application/x-www-form-urlencoded"]) {
-      const res = await raw(t, "/campaigns", body, contentType);
-      expectError(res, 400);
-      expect(res.json.error.details.issues.map((i: { path: string }) => i.path)).toEqual(["name", "required_pieces"]);
+    for (const contentType of [null, "text/plain", "application/x-www-form-urlencoded", "multipart/form-data"]) {
+      const res = await raw(f.t, path(f), body, contentType);
+      expectError(res, 415);
+      expect(res.json.error.code).toBe("content_type_invalido");
     }
+  });
+
+  it("Content-Type JSON com charset é aceito", async () => {
+    const t = setup();
+    const res = await raw(t, "/campaigns", JSON.stringify({ name: "x", required_pieces: ["video"] }), "application/json; charset=utf-8");
+    expect(res.status).toBe(201);
+  });
+
+  it("request-changes sem corpo nenhum é aceito sem Content-Type", async () => {
+    const f = await fixture();
+    const res = await f.t.app.request(`/versions/${f.videoId}/request-changes`, { method: "POST" });
+    expect(res.status).toBe(200);
   });
 
   it("erro de validação traz caminho e motivo de cada campo", async () => {

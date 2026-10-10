@@ -8,7 +8,7 @@ const BASE = __ENV.BASE_URL || "http://localhost:3106";
 const JSON_HEADERS = { headers: { "content-type": "application/json" } };
 const PIECES = ["roteiro", "video", "capa", "legenda"];
 
-http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 409, 413, 422));
+http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 409, 413, 415, 422));
 
 const deliveriesApproved = new Counter("deliveries_approved");
 const approvalsRevoked = new Counter("approvals_revoked");
