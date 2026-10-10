@@ -51,8 +51,7 @@ describe("várias conexões ao mesmo arquivo sqlite", () => {
       const workers = Array.from(
         { length: THREADS },
         () =>
-          new Worker(new URL("./workers/actor.ts", import.meta.url), {
-            execArgv: ["--import", "tsx"],
+          new Worker(new URL("./workers/actor-entry.mjs", import.meta.url), {
             workerData: { dbPath, deliveries, shared, iterations: ITERATIONS },
           }),
       );
@@ -64,8 +63,16 @@ describe("várias conexões ao mesmo arquivo sqlite", () => {
           }),
       );
 
-      // Espera todas as threads abrirem a conexão e só então solta a barreira.
-      while (Atomics.load(flags, 0) < THREADS) Atomics.wait(flags, 0, Atomics.load(flags, 0), 50);
+      // Espera todas as threads abrirem a conexão e só então solta a barreira. A espera cede o
+      // event loop para que um erro ao subir a thread chegue aqui e falhe o teste em vez de travar.
+      let workerError: unknown;
+      for (const r of results) r.catch((e: unknown) => (workerError ??= e));
+      const deadline = Date.now() + 30_000;
+      while (Atomics.load(flags, 0) < THREADS) {
+        if (workerError) throw workerError;
+        if (Date.now() > deadline) throw new Error("as threads não ficaram prontas em 30 s");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
       Atomics.store(flags, 1, 1);
       Atomics.notify(flags, 1);
 
