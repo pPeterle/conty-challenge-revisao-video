@@ -62,7 +62,7 @@ stateDiagram-v2
 | Comentário não migra para a versão nova | comentário tem `version_id` fixo e a listagem é por versão | `comentário não migra sozinho para a versão nova, e o antigo segue na versão antiga` |
 | Aprovar versão que já não é a atual | `review` em `src/service.ts` devolve 409 `versao_desatualizada` | `aprovar versão que já não é a atual falha com versao_desatualizada` |
 
-Os testes ficam em `test/unit/domain.test.ts`, `test/integration/review.test.ts` e nos arquivos citados nas seções seguintes.
+Os testes ficam em `test/unit/domain.test.ts`, `test/integration/review.test.ts` e nos arquivos citados em [`docs/concorrencia-e-carga.md`](docs/concorrencia-e-carga.md).
 
 ### Qual peça desfaz a aprovação
 
@@ -78,10 +78,6 @@ Outras decisões:
 - Peça sem duração (roteiro, capa, legenda) aceita comentário sem `at_second` e recusa `duration_seconds` no envio. Vídeo exige os dois.
 
 Erros seguem `{ "error": { "code", "message", "details?" } }`: 400 validação (`validacao`, com `details.issues` trazendo caminho e motivo de cada campo), 404 não encontrado, 409 conflito de estado (`versao_desatualizada`, `transicao_invalida`), 413 corpo grande demais, 415 Content-Type que não é JSON, 422 regra de negócio (`pecas_pendentes`, `segundo_fora_da_duracao`).
-
-## Validação e limites
-
-Corpo, params e query passam por schemas zod em `src/schemas.ts`, com um único hook que converte o erro no formato acima. JSON malformado, `null`, array ou valor solto no lugar de objeto, tipo errado, string vazia ou só espaços, número negativo ou não finito e id fora do formato `[A-Za-z0-9-]{1,64}` dão 400. Campo desconhecido é descartado. Rota com corpo exige `Content-Type: application/json` e responde 415 `content_type_invalido` se ele faltar ou for outro; a exceção é `request-changes`, cujo corpo é opcional e aceita POST sem corpo nenhum. Limites: corpo de 64 KB (413), `required_pieces` com até 20 itens, `duration_seconds` até 21600, textos com teto de tamanho, `limit` de 1 a 500 (padrão 100) e `offset` inteiro não negativo nas listagens. Os casos estão em `test/integration/payloads-invalidos.test.ts`, que também confere que nenhum deles grava nada no banco. Erro inesperado vira 500 com corpo genérico (`erro_interno`), sem stack trace; o mesmo arquivo tem um teste que força esse caso fechando o banco.
 
 ## Endpoints
 
@@ -232,9 +228,21 @@ A marca pede alteração na legenda (`"status": "alteracao_solicitada"`, `"revie
 Payload inválido em `POST /campaigns` com `{"name":5,"required_pieces":["video",3],"extra":true}` (HTTP 400):
 
 ```json
-{ "error": { "code": "validacao", "message": "name: precisa ser texto; required_pieces.1: precisa ser texto.",
+{ "error": { "code": "validacao", "message": "name: precisa ser texto; required_pieces.1: precisa ser texto; extra: campo não aceito.",
     "details": { "issues": [ { "path": "name", "message": "precisa ser texto" },
-                             { "path": "required_pieces.1", "message": "precisa ser texto" } ] } } }
+                             { "path": "required_pieces.1", "message": "precisa ser texto" },
+                             { "path": "extra", "message": "campo não aceito" } ] } } }
+```
+
+Comentário com `at_second: -1` é erro de formato (HTTP 400); com `at_second: 50` num vídeo de 42 s é regra da versão (HTTP 422):
+
+```json
+{ "error": { "code": "validacao", "message": "at_second: precisa ser no mínimo 0.",
+    "details": { "issues": [ { "path": "at_second", "message": "precisa ser no mínimo 0" } ] } } }
+```
+
+```json
+{ "error": { "code": "segundo_fora_da_duracao", "message": "at_second 50 está fora da versão v1, que dura 42s." } }
 ```
 
 O mesmo `POST /campaigns` sem `Content-Type` (HTTP 415):
@@ -250,76 +258,14 @@ Tipo de peça fora do catálogo (HTTP 400):
     "message": "Tipo de peça desconhecido: \"trilha\". Tipos aceitos: roteiro, video, capa, legenda." } }
 ```
 
-## Concorrência e idempotência
+## Validação, concorrência e carga
 
-Toda escrita roda numa função síncrona dentro de `BEGIN IMMEDIATE ... COMMIT` (`transaction` em `src/db.ts`). O lock de escrita é pego antes da primeira leitura e não há `await` entre ler e gravar, então a checagem e a gravação enxergam o mesmo estado. Os casos que me preocupavam:
-
-- Aprovar a v2 enquanto chega a v3 na mesma peça. Se o envio entra primeiro, a aprovação vê que a atual é v3 e devolve 409 `versao_desatualizada`. Se a aprovação entra primeiro, v2 fica aprovada e v3 vira a atual em revisão. O id da versão no path funciona como `expected_version`: o revisor aprova exatamente o que viu.
-- Aprovar a entrega enquanto chega versão nova numa peça exigida. Ou a checagem vê a versão em revisão e devolve 422, ou a aprovação entra e o envio a desfaz logo depois, com `delivery.approval_revoked`. Nos dois casos a entrega termina em produção.
-- Várias aprovações simultâneas da mesma entrega, ou da versão que encerra a última pendência. A primeira aprova e as demais encontram a entrega já aprovada, sem evento novo. Um índice único parcial em `delivery_events (delivery_id, round) WHERE type = 'delivery.approved'` impede uma segunda emissão na mesma rodada, mesmo que algum caminho do código erre.
-- Envios simultâneos na mesma peça. Cada transação calcula `max+1`, e `UNIQUE(delivery_id, piece_type, number)` garante que não se repete.
-- Criar a entrega do mesmo criador duas vezes devolve a mesma (`ON CONFLICT DO NOTHING`).
-
-Esses casos têm três camadas de teste:
-
-- `test/integration/concurrency.test.ts` dispara requisições com `Promise.all` numa só conexão.
-- `test/integration/multi-conexao.test.ts` sobe seis `worker_threads`, cada uma com a própria conexão ao mesmo arquivo sqlite em disco (WAL, `busy_timeout`). Elas saem juntas por uma barreira em `SharedArrayBuffer` com `Atomics.wait`, enviam versões e aprovam em paralelo, e no fim o teste roda `checkInvariants` (`src/invariants.ts`) no banco. Conferi que ele pega erro de verdade: trocando `BEGIN IMMEDIATE` por `BEGIN`, falha com `database is locked`.
-- `test/integration/modelo.test.ts` usa fast-check para gerar sequências aleatórias de envio, revisão, aprovação de versão desatualizada e aprovação da entrega. Ele roda cada sequência na API e num modelo de referência escrito a partir do enunciado, comparando status, rodada, pendências e versão atual de cada peça a cada passo. Fazendo a revogação valer para qualquer peça, ele falha e reduz o contraexemplo a cinco passos: campanha que exige só roteiro, envia e aprova o roteiro, aprova a entrega, chega uma legenda e a API desfaz a aprovação que o modelo mantém. `test/unit/propriedades.test.ts` cobre as propriedades das funções puras.
-
-## Por que essa solução
-
-Um processo Node com sqlite serializa as escritas. Para revisão de peças (pense em centenas ou milhares de entregas ativas, cada uma recebendo poucas versões por dia) isso sobra: a carga abaixo passou de 2.900 req/s nesta máquina, com p95 abaixo de 30 ms. Lock distribuído ou Redis não resolveriam nada que a transação e as restrições `UNIQUE` já não resolvem, então não usei.
-
-Com várias instâncias da API eu trocaria o sqlite por Postgres e manteria o desenho: transação com `SELECT ... FOR UPDATE` na linha da entrega (que serializa envio, revisão e aprovação da mesma entrega), as mesmas restrições únicas e o mesmo índice parcial por rodada. O `delivery.approved` sairia por uma tabela outbox lida por um worker, e o consumidor de pagamento usaria `(delivery_id, round)` como chave de idempotência. Lock distribuído só entraria se aparecesse um efeito externo que não cabe na transação.
-
-## Teste de carga
-
-`npm run load` (`scripts/load.sh`) sobe a API na porta 3106 com banco num diretório temporário e roda `load/review.js` no k6 (Docker, `grafana/k6:0.54.0`). São 24 entregas (campanhas com as quatro peças, só vídeo, e vídeo com capa) e até 50 VUs por 45 s. Cada iteração sorteia uma ação: enviar versão de qualquer peça, revisar a versão atual (aprovar ou pedir alteração), aprovar a entrega, comentar no vídeo ou, em 10% das vezes, mandar um payload inválido (JSON quebrado, tipos errados, ids com unicode, query fora do limite, com e sem Content-Type). Poucas entregas para muitos clientes força disputa na mesma peça. 409 e 422 contam como respostas esperadas, desde que tragam o código certo, e o payload inválido precisa voltar 4xx no formato de erro padrão.
-
-No fim, `scripts/verify-load.ts` roda `checkInvariants` no banco e sai com código 1 se encontrar entrega aprovada com peça exigida sem versão atual aprovada, entrega desfeita sem pendência que não voltou a aprovada, `delivery.approved` repetido na mesma rodada, aprovações menos revogações diferente do status atual, numeração de versão com buraco ou repetição, ou comentário fora da duração. Também falha se a carga não chegou a aprovar, desfazer e reaprovar automaticamente.
-
-Resultado de uma execução real, nesta máquina (2026-10-10):
-
-```
-     ✓ payload inválido: nunca 5xx
-     ✓ payload inválido: erro no formato padrão
-     ✓ GET entrega: 200
-     ✓ aprovação da entrega: 200 ou 422 pecas_pendentes
-     ✓ envio de versão: 201
-     ✓ revisão de versão: 200 ou 409 conhecido
-     ✓ comentário: 201
-
-     approvals_revoked..............: 4130
-     blocked_delivery_approvals.....: 13393
-   ✓ checks.........................: 100.00% 134763 out of 134763
-     deliveries_approved............: 22
-   ✓ http_req_duration..............: avg=14.3ms  min=182.96µs med=15.28ms max=98.26ms p(90)=23.15ms p(95)=25.76ms
-   ✓ http_req_failed................: 0.00%   0 out of 131905
-     http_reqs......................: 131905  2927.712571/s
-     invalid_payloads_sent..........: 9881
-     stale_version_approvals........: 2000
-
-resumo do banco após a carga: {
-  entregas: 24,
-  entregas_aprovadas_agora: 12,
-  versoes: 26744,
-  versoes_aprovadas: 15678,
-  comentarios: 6942,
-  eventos_delivery_approved: 4142,
-  eventos_approval_revoked: 4130,
-  reaprovacoes_automaticas: 4118
-}
-OK: invariantes I1 a I5 e I8 valem em todas as entregas.
-```
-
-No banco, 4142 eventos `delivery.approved` (4118 deles automáticos) menos 4130 revogações dá 12, que é o número de entregas aprovadas no fim. O contador `deliveries_approved` do k6 só conta as aprovações explícitas que ele mesmo viu responder com `already_approved: false`. 2000 tentativas de aprovar versão desatualizada foram recusadas com 409, e 9881 payloads inválidos voltaram 4xx sem nenhum 5xx.
-
-Os thresholds do k6 são `http_req_failed < 1%`, `checks > 99%` e p95 abaixo de 500 ms. O teto de latência é folgado para a carga passar em máquinas mais lentas; quem reprova a rodada de verdade são os checks, a taxa de erro e a verificação de invariantes.
+Toda entrada passa por schemas zod (`src/schemas.ts`); corpo com campo desconhecido, tipo errado ou Content-Type que não é JSON é recusado (400 ou 415) sem gravar nada. Toda escrita roda dentro de `BEGIN IMMEDIATE`, com restrições `UNIQUE` e um índice único parcial que garante um `delivery.approved` por rodada. A carga com k6 (`npm run load`) mistura envios, revisões, aprovações e payloads inválidos em poucas entregas e confere as invariantes no banco no fim. Os detalhes, a justificativa de sqlite nesta escala e os números reais da carga estão em [`docs/concorrencia-e-carga.md`](docs/concorrencia-e-carga.md).
 
 ## O que ficou de fora
 
 - Upload de arquivo. A versão guarda uma `url` ou um `file_name` fictício; a duração vem do cliente e não é lida do arquivo.
-- Autenticação e papéis (quem é marca, quem é criador). Qualquer cliente pode aprovar.
+- Autenticação e papéis (quem é marca, quem é criador). Qualquer cliente pode aprovar. Pensei num header `X-Ator: marca|criador` com 403 para o criador que tenta aprovar, mas sem autenticação o cliente declara o próprio papel, então ele só daria aparência de controle; preferi deixar de fora até existir identidade de verdade.
 - Chave de idempotência no envio de versão. Um retry do cliente cria outra versão. Com mais tempo eu aceitaria um header `Idempotency-Key` gravado com `UNIQUE`.
 - Publicação real do outbox. Os eventos ficam em `delivery_events`; não há worker lendo.
 - Edição de campanha e de peças exigidas, de propósito (ver decisões).
