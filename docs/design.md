@@ -22,14 +22,13 @@ deliveries(id PK, campaign_id FK, creator_id, status, approval_round, approved_a
 piece_versions(id PK, delivery_id FK, piece_type FK, number, url, file_name, duration_seconds,
                status, review_note, created_at, reviewed_at,
                UNIQUE(delivery_id, piece_type, number))
-delivery_changed_pieces(delivery_id FK, piece_type FK, created_at, PK(delivery_id, piece_type))
 comments(id PK, version_id FK, author, body, at_second, created_at)
 delivery_events(id PK autoincrement, delivery_id FK, type, round, payload JSON, created_at)
   UNIQUE INDEX (delivery_id, round) WHERE type = 'delivery.approved'
   UNIQUE INDEX (delivery_id, round) WHERE type = 'delivery.approval_revoked'
 ```
 
-A lista de peças exigidas é linha em `campaign_required_pieces`. O código nunca pergunta "é vídeo?" para decidir se algo bloqueia: ele lê essa tabela e `delivery_changed_pieces`, que guarda as peças não exigidas que receberam versão nova com a entrega aprovada. O único atributo por tipo que o código consulta é `piece_types.timed`, que decide se a versão precisa de `duration_seconds` e se o comentário precisa de `at_second`.
+A lista de peças exigidas é linha em `campaign_required_pieces`. O código nunca pergunta "é vídeo?" para decidir se algo bloqueia: ele lê essa tabela. O único atributo por tipo que o código consulta é `piece_types.timed`, que decide se a versão precisa de `duration_seconds` e se o comentário precisa de `at_second`.
 
 ## Estados
 
@@ -50,13 +49,13 @@ Entrega:
 stateDiagram-v2
   [*] --> em_producao
   em_producao --> aprovada: POST /deliveries/:id/approve (primeira vez, valida a regra)
-  aprovada --> em_producao: versão nova em qualquer peça
-  em_producao --> aprovada: automático, quando a última pendência de uma entrega desfeita é aprovada
+  aprovada --> em_producao: versão nova numa peça exigida
+  em_producao --> aprovada: automático, quando a última peça exigida pendente de uma entrega desfeita é aprovada
 ```
 
 ## Invariantes
 
-1. I1: entrega `aprovada` implica que toda peça bloqueante (exigida, ou não exigida que mudou depois de uma aprovação) tem versão atual com status `aprovada`.
+1. I1: entrega `aprovada` implica que toda peça exigida tem versão atual com status `aprovada`.
 2. I2: números de versão por (entrega, peça) são 1..n, sem buraco nem repetição. Garantido por `UNIQUE` e por calcular `max+1` dentro da mesma transação.
 3. I3: no máximo um `delivery.approved` por rodada de aprovação. `approval_round` incrementa a cada aprovação e o índice único parcial impede repetir a rodada.
 4. I4: para cada entrega, `#approved - #revoked` é 1 se ela está aprovada e 0 se não está.
@@ -68,9 +67,9 @@ stateDiagram-v2
 ## Decisões
 
 - A primeira aprovação da entrega é um ato explícito (`POST /deliveries/:id/approve`). Ela libera pagamento, então alguém precisa pedir. O endpoint recalcula a regra a partir das versões atuais; o status gravado é consequência dessa checagem, nunca um campo que o cliente escreve.
-- Pendência gera 422 `pecas_pendentes` com `details.pending`, uma linha por peça bloqueante que falta, com `required` e o motivo `sem_versao` ou `versao_atual_nao_aprovada` (este último traz número e status da versão atual).
+- Pendência gera 422 `pecas_pendentes` com `details.pending`, uma linha por peça exigida que falta, com o motivo `sem_versao` ou `versao_atual_nao_aprovada` (este último traz número e status da versão atual).
 - Chamar `approve` numa entrega já aprovada devolve 200 com o estado atual e não emite evento novo.
-- O enunciado diz "Peça que a campanha não pediu não bloqueia" e também "se uma peça de uma entrega já aprovada recebe versão nova, a entrega deixa de estar aprovada até a nova versão ser aprovada". As duas valem ao pé da letra. A primeira governa a primeira aprovação: peça não pedida e pendente não impede aprovar. A segunda governa qualquer peça depois da aprovação: versão nova, exigida ou não, volta a entrega para `em_producao`, zera `approved_at` e grava `delivery.approval_revoked` com a rodada desfeita. Se a peça não é exigida, ela entra em `delivery_changed_pieces` e passa a bloquear, para que "até a nova versão ser aprovada" tenha efeito.
+- Três frases do enunciado tratam de quais peças contam: "A entrega só pode ser aprovada quando cada peça exigida tem uma versão aprovada", "Peça que a campanha não pediu não bloqueia" e "se uma peça de uma entrega já aprovada recebe versão nova, a entrega deixa de estar aprovada até a nova versão ser aprovada". O "uma peça" da terceira é uma das peças que contam para a aprovação, as exigidas. Na outra leitura, uma campanha só de vídeo aprovada que recebe uma legenda (ou um roteiro) e tem essa legenda recusada ficaria travada por uma peça que não pediu, o que contradiz "não bloqueia" e "Campanha só de vídeo não exige roteiro" e ainda faz o resultado depender da ordem dos envios. Então versão nova numa peça exigida volta a entrega para `em_producao`, zera `approved_at` e grava `delivery.approval_revoked` com a rodada desfeita; em peça não exigida, nada muda.
 - Quando a versão nova é aprovada e não resta pendência, a entrega volta a `aprovada` na mesma transação, com rodada nova e `delivery.approved` marcado `automatic: true`. O índice único parcial garante um evento por rodada.
 - `payable` é `status === 'aprovada'`, exposto no GET da entrega.
 - Aprovar ou pedir alteração numa versão que não é a atual devolve 409 `versao_desatualizada`, com o número da versão atual em `details`. O id da versão é o "expected version": o cliente aprova exatamente o que viu.
@@ -105,19 +104,19 @@ O servidor é um processo Node com `node:sqlite` síncrono. Toda operação de e
 | POST | `/deliveries/:id/approve` | aprova a entrega se a regra deixar |
 | GET | `/deliveries/:id/events` | histórico da entrega |
 
-Listagens aceitam `limit` (1 a 500, padrão 100) e `offset`. Toda entrada passa por schemas zod em `src/schemas.ts`.
+Listagens aceitam `limit` (1 a 500, padrão 100) e `offset`. Toda entrada passa por schemas zod em `src/schemas.ts`; rota com corpo exige `Content-Type: application/json` (415 caso contrário). As invariantes I1 a I5 e I8 são conferidas no banco por `src/invariants.ts`, usado pela carga e pelo teste com várias conexões.
 
 ## Revisão do design contra o enunciado
 
 | Item | Como o modelo atende |
 | --- | --- |
 | Aprovar com peça obrigatória pendente falha com erro claro | 422 `pecas_pendentes` com lista por peça e motivo |
-| Versão nova desfaz a aprovação até ser aprovada | envio em qualquer peça volta a entrega para `em_producao`; aprovar a versão nova (e as demais pendências) reaprova sozinho |
+| Versão nova desfaz a aprovação até ser aprovada | envio em peça exigida volta a entrega para `em_producao`; aprovar a versão nova (e as demais pendências) reaprova sozinho |
 | Campanha só de vídeo não exige roteiro | a regra percorre só `campaign_required_pieces`; campanha `["video"]` aprova sem roteiro |
 | Comentário não migra | comentário tem `version_id` fixo; versão nova nasce sem comentários |
 | Lista de peças exigidas é dado | tabela `campaign_required_pieces`; a função pura recebe a lista como argumento |
 | Comentário preso a um segundo, visível na versão | `at_second` validado contra a duração daquela versão; listagem por versão |
 | Versão que substitui a anterior | `number` crescente; atual é a de maior número; anteriores continuam consultáveis |
-| Peça não pedida não bloqueia | a função pura ignora peças fora da lista exigida, salvo as que mudaram depois de uma aprovação |
+| Peça não pedida não bloqueia | a função pura ignora peças fora da lista exigida, antes e depois da aprovação |
 
-Ponto que conferi duas vezes: I1 só pode quebrar se (a) a versão atual de uma peça bloqueante mudar, (b) o status de uma versão atual aprovada mudar ou (c) a lista de exigidas mudar. (a) é tratado no envio, que desfaz a aprovação para qualquer peça, (b) é impossível pela máquina de estados da versão e (c) é impossível porque não há edição de campanha.
+Ponto que conferi duas vezes: I1 só pode quebrar se (a) a versão atual de uma peça exigida mudar, (b) o status de uma versão atual aprovada mudar ou (c) a lista de exigidas mudar. (a) é tratado no envio, (b) é impossível pela máquina de estados da versão e (c) é impossível porque não há edição de campanha.
