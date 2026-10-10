@@ -38,6 +38,18 @@ export class ReviewService {
     return this.clock.now().toISOString();
   }
 
+  private deliveryOr404(id: string): DeliveryRow {
+    const delivery = this.repo.getDelivery(id);
+    if (!delivery) throw notFound("Entrega");
+    return delivery;
+  }
+
+  private versionOr404(id: string): VersionRow {
+    const version = this.repo.getVersion(id);
+    if (!version) throw notFound("Versão");
+    return version;
+  }
+
   private tx<T>(fn: () => T): T {
     return transaction(this.repo.db, fn);
   }
@@ -68,19 +80,17 @@ export class ReviewService {
   }
 
   getDelivery(id: string) {
-    const delivery = this.repo.getDelivery(id);
-    if (!delivery) throw notFound("Entrega");
+    const delivery = this.deliveryOr404(id);
     return this.deliveryView(delivery);
   }
 
   getVersion(id: string) {
-    const version = this.repo.getVersion(id);
-    if (!version) throw notFound("Versão");
+    const version = this.versionOr404(id);
     return this.versionView(version);
   }
 
   listVersions(deliveryId: string, pieceType: string, page: Page = DEFAULT_PAGE) {
-    if (!this.repo.getDelivery(deliveryId)) throw notFound("Entrega");
+    this.deliveryOr404(deliveryId);
     this.assertKnownPiece(pieceType);
     const versions = this.repo.listVersions(deliveryId, pieceType, page);
     const currentNumber = this.repo.currentVersion(deliveryId, pieceType)?.number;
@@ -88,12 +98,12 @@ export class ReviewService {
   }
 
   listComments(versionId: string, page: Page = DEFAULT_PAGE) {
-    if (!this.repo.getVersion(versionId)) throw notFound("Versão");
-    return this.repo.listComments(versionId, page).map(toCommentJson);
+    this.versionOr404(versionId);
+    return this.repo.listComments(versionId, page);
   }
 
   listEvents(deliveryId: string, page: Page = DEFAULT_PAGE) {
-    if (!this.repo.getDelivery(deliveryId)) throw notFound("Entrega");
+    this.deliveryOr404(deliveryId);
     return this.repo.listEvents(deliveryId, page).map(toEventJson);
   }
 
@@ -139,8 +149,7 @@ export class ReviewService {
     }
 
     return this.tx(() => {
-      const delivery = this.repo.getDelivery(deliveryId);
-      if (!delivery) throw notFound("Entrega");
+      const delivery = this.deliveryOr404(deliveryId);
       const now = this.now();
       const version: VersionRow = {
         id: this.newId(),
@@ -191,8 +200,7 @@ export class ReviewService {
 
   private review(versionId: string, decision: ReviewDecision, note: string | null) {
     return this.tx(() => {
-      const version = this.repo.getVersion(versionId);
-      if (!version) throw notFound("Versão");
+      const version = this.versionOr404(versionId);
       const current = this.repo.currentVersion(version.delivery_id, version.piece_type)!;
       if (current.id !== version.id) {
         throw new AppError(
@@ -226,8 +234,7 @@ export class ReviewService {
 
   addComment(versionId: string, input: NewComment) {
     return this.tx(() => {
-      const version = this.repo.getVersion(versionId);
-      if (!version) throw notFound("Versão");
+      const version = this.versionOr404(versionId);
       if (version.duration_seconds !== null) {
         if (input.at_second === undefined) {
           throw validation("Comentário em versão com duração precisa de at_second.");
@@ -251,7 +258,7 @@ export class ReviewService {
         created_at: this.now(),
       };
       this.repo.insertComment(comment);
-      return toCommentJson(comment);
+      return comment;
     });
   }
 
@@ -261,8 +268,7 @@ export class ReviewService {
    */
   approveDelivery(deliveryId: string) {
     return this.tx(() => {
-      const delivery = this.repo.getDelivery(deliveryId);
-      if (!delivery) throw notFound("Entrega");
+      const delivery = this.deliveryOr404(deliveryId);
       if (delivery.status === "aprovada") return { already_approved: true, delivery: this.deliveryView(delivery) };
 
       const { pending } = this.evaluate(delivery);
@@ -366,10 +372,6 @@ function toVersionJson(v: VersionRow, isCurrent: boolean) {
     created_at: v.created_at,
     reviewed_at: v.reviewed_at,
   };
-}
-
-function toCommentJson(c: CommentRow) {
-  return { ...c };
 }
 
 function toEventJson(e: EventRow) {
