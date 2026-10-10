@@ -114,11 +114,13 @@ export const newVersionSchema = z
   });
 export type NewVersion = z.infer<typeof newVersionSchema>;
 
+// Formato (número, não negativo) é validação de entrada. Passar da duração da versão é regra de
+// negócio e dá 422 no serviço, porque depende da versão comentada.
 export const newCommentSchema = z
   .object({
     author: text(200),
     body: text(2000),
-    at_second: optionalNumber(-Infinity, Number.MAX_VALUE),
+    at_second: optionalNumber(0, Number.MAX_VALUE),
   })
   .strict();
 export type NewComment = z.infer<typeof newCommentSchema>;

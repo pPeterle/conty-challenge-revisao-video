@@ -357,7 +357,8 @@ describe("comentários ancorados em segundo", () => {
     expect(after.status).toBe(422);
     expect(after.body.error.code).toBe("segundo_fora_da_duracao");
     const negative = await t.call("POST", `/versions/${v1.body.version.id}/comments`, { author: "m", body: "x", at_second: -1 });
-    expect(negative.status).toBe(422);
+    expect(negative.status).toBe(400);
+    expect(negative.body.error.code).toBe("validacao");
     const missing = await t.call("POST", `/versions/${v1.body.version.id}/comments`, { author: "m", body: "x" });
     expect(missing.status).toBe(400);
   });

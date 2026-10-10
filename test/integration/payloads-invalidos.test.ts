@@ -127,7 +127,7 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     ["body vazio", { author: "m", body: "", at_second: 1 }, 400],
     ["sem at_second em vídeo", { author: "m", body: "x" }, 400],
     ["at_second string", { author: "m", body: "x", at_second: "3" }, 400],
-    ["at_second negativo", { author: "m", body: "x", at_second: -1 }, 422],
+    ["at_second negativo", { author: "m", body: "x", at_second: -1 }, 400],
     ["at_second além da duração", { author: "m", body: "x", at_second: 31 }, 422],
     ["at_second enorme", { author: "m", body: "x", at_second: 1e300 }, 422],
     ["body gigante", { author: "m", body: "x".repeat(2001), at_second: 1 }, 400],
@@ -175,6 +175,16 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     expectError(res, 400);
     expect(res.json.error.details.issues).toContainEqual({ path: "__proto__", message: "campo não aceito" });
     expect(({} as Record<string, unknown>).status).toBeUndefined();
+  });
+
+  it("at_second negativo é erro de formato (400); passar da duração é regra da versão (422)", async () => {
+    const f = await fixture();
+    const negative = await raw(f.t, `/versions/${f.videoId}/comments`, JSON.stringify({ author: "m", body: "x", at_second: -0.5 }));
+    expectError(negative, 400);
+    expect(negative.json.error.details.issues).toEqual([{ path: "at_second", message: "precisa ser no mínimo 0" }]);
+    const beyond = await raw(f.t, `/versions/${f.videoId}/comments`, JSON.stringify({ author: "m", body: "x", at_second: 30.5 }));
+    expectError(beyond, 422);
+    expect(beyond.json.error.code).toBe("segundo_fora_da_duracao");
   });
 
   it.each(ENDPOINTS)("%s sem Content-Type JSON devolve 415", async (_name, path) => {
