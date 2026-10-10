@@ -262,6 +262,18 @@ Tipo de peça fora do catálogo (HTTP 400):
 
 Toda entrada passa por schemas zod (`src/schemas.ts`); corpo com campo desconhecido, tipo errado ou Content-Type que não é JSON é recusado (400 ou 415) sem gravar nada. Toda escrita roda dentro de `BEGIN IMMEDIATE`, com restrições `UNIQUE` e um índice único parcial que garante um `delivery.approved` por rodada. A carga com k6 (`npm run load`) mistura envios, revisões, aprovações e payloads inválidos em poucas entregas e confere as invariantes no banco no fim. Os detalhes, a justificativa de sqlite nesta escala e os números reais da carga estão em [`docs/concorrencia-e-carga.md`](docs/concorrencia-e-carga.md).
 
+## Mutações que os testes pegam
+
+Apliquei cada mutação no código, rodei a suíte inteira e reverti. Todas fizeram ao menos um teste falhar:
+
+| Mutação | Teste que falha |
+| --- | --- |
+| Versão nova em qualquer peça desfaz a aprovação | `versão nova em peça não exigida não desfaz nem bloqueia a entrega aprovada` (e mais 3) |
+| Aprovar versão que não é mais a atual | `aprovar versão que já não é a atual falha com versao_desatualizada` e o teste de modelo em `test/integration/modelo.test.ts` |
+| Comentário copiado para a versão nova | `comentário não migra sozinho para a versão nova, e o antigo segue na versão antiga` |
+| Ignorar a lista da campanha (toda peça vira exigida) | `campanha só de vídeo não exige roteiro` (e mais 16) |
+| `BEGIN` sem `IMMEDIATE` | `threads aprovando e enviando versão em paralelo mantêm as invariantes` (`test/integration/multi-conexao.test.ts`) |
+
 ## O que ficou de fora
 
 - Upload de arquivo. A versão guarda uma `url` ou um `file_name` fictício; a duração vem do cliente e não é lida do arquivo.
