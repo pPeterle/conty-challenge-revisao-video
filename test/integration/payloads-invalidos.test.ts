@@ -279,4 +279,19 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     expect(snapshot()).toEqual(before);
     expect((await f.t.call("GET", `/versions/${f.videoId}`)).body.status).toBe("em_revisao");
   });
+
+  it("erro inesperado vira 500 JSON genérico, sem stack trace", async () => {
+    const f = await fixture();
+    f.t.db.close();
+    const original = console.error;
+    console.error = () => {};
+    try {
+      const res = await f.t.call("GET", `/deliveries/${f.deliveryId}`);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: { code: "erro_interno", message: "Erro interno." } });
+      expect(JSON.stringify(res.body)).not.toMatch(/at |\.ts|database/);
+    } finally {
+      console.error = original;
+    }
+  });
 });

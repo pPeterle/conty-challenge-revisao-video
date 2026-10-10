@@ -81,7 +81,7 @@ Erros seguem `{ "error": { "code", "message", "details?" } }`: 400 validação (
 
 ## Validação e limites
 
-Corpo, params e query passam por schemas zod em `src/schemas.ts`, com um único hook que converte o erro no formato acima. JSON malformado, `null`, array ou valor solto no lugar de objeto, tipo errado, string vazia ou só espaços, número negativo ou não finito e id fora do formato `[A-Za-z0-9-]{1,64}` dão 400. Campo desconhecido é descartado. Rota com corpo exige `Content-Type: application/json` e responde 415 `content_type_invalido` se ele faltar ou for outro; a exceção é `request-changes`, cujo corpo é opcional e aceita POST sem corpo nenhum. Limites: corpo de 64 KB (413), `required_pieces` com até 20 itens, `duration_seconds` até 21600, textos com teto de tamanho, `limit` de 1 a 500 (padrão 100) e `offset` inteiro não negativo nas listagens. Os casos estão em `test/integration/payloads-invalidos.test.ts`, que também confere que nenhum deles grava nada no banco.
+Corpo, params e query passam por schemas zod em `src/schemas.ts`, com um único hook que converte o erro no formato acima. JSON malformado, `null`, array ou valor solto no lugar de objeto, tipo errado, string vazia ou só espaços, número negativo ou não finito e id fora do formato `[A-Za-z0-9-]{1,64}` dão 400. Campo desconhecido é descartado. Rota com corpo exige `Content-Type: application/json` e responde 415 `content_type_invalido` se ele faltar ou for outro; a exceção é `request-changes`, cujo corpo é opcional e aceita POST sem corpo nenhum. Limites: corpo de 64 KB (413), `required_pieces` com até 20 itens, `duration_seconds` até 21600, textos com teto de tamanho, `limit` de 1 a 500 (padrão 100) e `offset` inteiro não negativo nas listagens. Os casos estão em `test/integration/payloads-invalidos.test.ts`, que também confere que nenhum deles grava nada no banco. Erro inesperado vira 500 com corpo genérico (`erro_interno`), sem stack trace; o mesmo arquivo tem um teste que força esse caso fechando o banco.
 
 ## Endpoints
 
@@ -268,7 +268,7 @@ Esses casos têm três camadas de teste:
 
 ## Por que essa solução
 
-Um processo Node com sqlite serializa as escritas. Para revisão de peças (pense em centenas ou milhares de entregas ativas, cada uma recebendo poucas versões por dia) isso sobra: a carga abaixo passou de 2.300 req/s numa máquina local, com p95 abaixo de 35 ms. Lock distribuído ou Redis não resolveriam nada que a transação e as restrições `UNIQUE` já não resolvem, então não usei.
+Um processo Node com sqlite serializa as escritas. Para revisão de peças (pense em centenas ou milhares de entregas ativas, cada uma recebendo poucas versões por dia) isso sobra: a carga abaixo passou de 2.900 req/s nesta máquina, com p95 abaixo de 30 ms. Lock distribuído ou Redis não resolveriam nada que a transação e as restrições `UNIQUE` já não resolvem, então não usei.
 
 Com várias instâncias da API eu trocaria o sqlite por Postgres e manteria o desenho: transação com `SELECT ... FOR UPDATE` na linha da entrega (que serializa envio, revisão e aprovação da mesma entrega), as mesmas restrições únicas e o mesmo índice parcial por rodada. O `delivery.approved` sairia por uma tabela outbox lida por um worker, e o consumidor de pagamento usaria `(delivery_id, round)` como chave de idempotência. Lock distribuído só entraria se aparecesse um efeito externo que não cabe na transação.
 
@@ -278,41 +278,43 @@ Com várias instâncias da API eu trocaria o sqlite por Postgres e manteria o de
 
 No fim, `scripts/verify-load.ts` roda `checkInvariants` no banco e sai com código 1 se encontrar entrega aprovada com peça exigida sem versão atual aprovada, entrega desfeita sem pendência que não voltou a aprovada, `delivery.approved` repetido na mesma rodada, aprovações menos revogações diferente do status atual, numeração de versão com buraco ou repetição, ou comentário fora da duração. Também falha se a carga não chegou a aprovar, desfazer e reaprovar automaticamente.
 
-Resultado de uma execução real:
+Resultado de uma execução real, nesta máquina (2026-10-10):
 
 ```
-     ✓ envio de versão: 201
-     ✓ aprovação da entrega: 200 ou 422 pecas_pendentes
-     ✓ GET entrega: 200
      ✓ payload inválido: nunca 5xx
      ✓ payload inválido: erro no formato padrão
+     ✓ GET entrega: 200
+     ✓ aprovação da entrega: 200 ou 422 pecas_pendentes
+     ✓ envio de versão: 201
      ✓ revisão de versão: 200 ou 409 conhecido
      ✓ comentário: 201
 
-     approvals_revoked..............: 3151
-     blocked_delivery_approvals.....: 11041
-   ✓ checks.........................: 100.00% 109956 out of 109956
+     approvals_revoked..............: 4130
+     blocked_delivery_approvals.....: 13393
+   ✓ checks.........................: 100.00% 134763 out of 134763
      deliveries_approved............: 22
-   ✓ http_req_duration..............: avg=17.48ms min=313.16µs med=17.35ms max=235.81ms p(90)=27.01ms p(95)=32.32ms
-   ✓ http_req_failed................: 0.00%   0 out of 107635
-     http_reqs......................: 107635  2386.07476/s
-     invalid_payloads_sent..........: 8097
-     stale_version_approvals........: 1710
+   ✓ http_req_duration..............: avg=14.3ms  min=182.96µs med=15.28ms max=98.26ms p(90)=23.15ms p(95)=25.76ms
+   ✓ http_req_failed................: 0.00%   0 out of 131905
+     http_reqs......................: 131905  2927.712571/s
+     invalid_payloads_sent..........: 9881
+     stale_version_approvals........: 2000
 
 resumo do banco após a carga: {
   entregas: 24,
-  entregas_aprovadas_agora: 9,
-  versoes: 22025,
-  versoes_aprovadas: 12680,
-  comentarios: 5706,
-  eventos_delivery_approved: 3160,
-  eventos_approval_revoked: 3151,
-  reaprovacoes_automaticas: 3136
+  entregas_aprovadas_agora: 12,
+  versoes: 26744,
+  versoes_aprovadas: 15678,
+  comentarios: 6942,
+  eventos_delivery_approved: 4142,
+  eventos_approval_revoked: 4130,
+  reaprovacoes_automaticas: 4118
 }
 OK: invariantes I1 a I5 e I8 valem em todas as entregas.
 ```
 
-No banco, 3160 eventos `delivery.approved` (3136 deles automáticos) menos 3151 revogações dá 9, que é o número de entregas aprovadas no fim. O contador `deliveries_approved` do k6 só conta as aprovações explícitas que ele mesmo viu responder com `already_approved: false`. 1710 tentativas de aprovar versão desatualizada foram recusadas com 409, e 8097 payloads inválidos voltaram 4xx sem nenhum 5xx.
+No banco, 4142 eventos `delivery.approved` (4118 deles automáticos) menos 4130 revogações dá 12, que é o número de entregas aprovadas no fim. O contador `deliveries_approved` do k6 só conta as aprovações explícitas que ele mesmo viu responder com `already_approved: false`. 2000 tentativas de aprovar versão desatualizada foram recusadas com 409, e 9881 payloads inválidos voltaram 4xx sem nenhum 5xx.
+
+Os thresholds do k6 são `http_req_failed < 1%`, `checks > 99%` e p95 abaixo de 500 ms. O teto de latência é folgado para a carga passar em máquinas mais lentas; quem reprova a rodada de verdade são os checks, a taxa de erro e a verificação de invariantes.
 
 ## O que ficou de fora
 
