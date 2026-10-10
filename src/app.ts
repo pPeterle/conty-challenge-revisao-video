@@ -1,8 +1,22 @@
-import { Hono, type Context } from "hono";
+import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
+import { HTTPException } from "hono/http-exception";
 import type { DatabaseSync } from "node:sqlite";
 import type { Clock } from "./clock.ts";
-import { AppError, validation } from "./errors.ts";
-import { ReviewService, type NewComment, type NewVersion } from "./service.ts";
+import { AppError } from "./errors.ts";
+import {
+  LIMITS,
+  idParam,
+  newCampaignSchema,
+  newCommentSchema,
+  newDeliverySchema,
+  newVersionSchema,
+  pageQuery,
+  pieceParam,
+  requestChangesSchema,
+  validate,
+} from "./schemas.ts";
+import { ReviewService } from "./service.ts";
 
 export interface AppDeps {
   db: DatabaseSync;
@@ -10,60 +24,8 @@ export interface AppDeps {
   newId?: () => string;
 }
 
-type Body = Record<string, unknown>;
-
-async function readBody(c: Context): Promise<Body> {
-  const text = await c.req.text();
-  if (text.trim() === "") return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw validation("Corpo da requisição não é JSON válido.");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw validation("Corpo da requisição precisa ser um objeto JSON.");
-  }
-  return parsed as Body;
-}
-
-function requiredString(body: Body, field: string, max = 2000): string {
-  const value = body[field];
-  if (typeof value !== "string" || value.trim() === "") throw validation(`${field} é obrigatório (texto).`);
-  if (value.length > max) throw validation(`${field} passa de ${max} caracteres.`);
-  return value.trim();
-}
-
-function optionalString(body: Body, field: string, max = 2000): string | undefined {
-  if (body[field] === undefined || body[field] === null) return undefined;
-  return requiredString(body, field, max);
-}
-
-function optionalNumber(body: Body, field: string): number | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "number" || !Number.isFinite(value)) throw validation(`${field} precisa ser número.`);
-  return value;
-}
-
-function parseVersion(body: Body): NewVersion {
-  const url = optionalString(body, "url");
-  const file_name = optionalString(body, "file_name", 255);
-  if ((url === undefined) === (file_name === undefined)) {
-    throw validation("Informe exatamente um entre url e file_name.");
-  }
-  if (url !== undefined && !/^https?:\/\/\S+$/.test(url)) throw validation("url precisa começar com http:// ou https://.");
-  const duration_seconds = optionalNumber(body, "duration_seconds");
-  if (duration_seconds !== undefined && duration_seconds <= 0) throw validation("duration_seconds precisa ser maior que zero.");
-  return { url, file_name, duration_seconds };
-}
-
-function parseComment(body: Body): NewComment {
-  return {
-    author: requiredString(body, "author", 200),
-    body: requiredString(body, "body"),
-    at_second: optionalNumber(body, "at_second"),
-  };
+function errorBody(code: string, message: string, details?: Record<string, unknown>) {
+  return { error: { code, message, ...(details ? { details } : {}) } };
 }
 
 export function createApp(deps: AppDeps) {
@@ -71,70 +33,82 @@ export function createApp(deps: AppDeps) {
   const app = new Hono();
 
   app.onError((err, c) => {
-    if (err instanceof AppError) {
-      return c.json(
-        { error: { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) } },
-        err.status,
-      );
+    if (err instanceof AppError) return c.json(errorBody(err.code, err.message, err.details), err.status);
+    // O validador do Hono lança HTTPException 400 quando o corpo não é JSON válido.
+    if (err instanceof HTTPException && err.status === 400) {
+      return c.json(errorBody("validacao", "Corpo da requisição não é JSON válido."), 400);
     }
     console.error(err);
-    return c.json({ error: { code: "erro_interno", message: "Erro interno." } }, 500);
+    return c.json(errorBody("erro_interno", "Erro interno."), 500);
   });
 
-  app.notFound((c) => c.json({ error: { code: "rota_inexistente", message: "Rota não existe." } }, 404));
+  app.notFound((c) => c.json(errorBody("rota_inexistente", "Rota não existe."), 404));
+
+  app.use(
+    "*",
+    bodyLimit({
+      maxSize: LIMITS.bodyBytes,
+      onError: (c) => c.json(errorBody("corpo_grande_demais", `Corpo passa de ${LIMITS.bodyBytes} bytes.`), 413),
+    }),
+  );
 
   app.get("/health", (c) => c.json({ ok: true }));
 
   app.get("/piece-types", (c) => c.json(service.pieceTypes()));
 
-  app.post("/campaigns", async (c) => {
-    const body = await readBody(c);
-    const name = requiredString(body, "name", 200);
-    const pieces = body.required_pieces;
-    if (!Array.isArray(pieces) || pieces.length === 0 || !pieces.every((p) => typeof p === "string")) {
-      throw validation("required_pieces precisa ser uma lista não vazia de tipos de peça.");
-    }
-    return c.json(service.createCampaign({ name, required_pieces: pieces }), 201);
-  });
+  app.post("/campaigns", validate("json", newCampaignSchema), (c) =>
+    c.json(service.createCampaign(c.req.valid("json")), 201),
+  );
 
-  app.get("/campaigns/:id", (c) => c.json(service.getCampaign(c.req.param("id"))));
+  app.get("/campaigns/:id", validate("param", idParam), (c) => c.json(service.getCampaign(c.req.valid("param").id)));
 
-  app.post("/campaigns/:id/deliveries", async (c) => {
-    const body = await readBody(c);
-    const result = service.createDelivery(c.req.param("id"), requiredString(body, "creator_id", 200));
+  app.post("/campaigns/:id/deliveries", validate("param", idParam), validate("json", newDeliverySchema), (c) => {
+    const result = service.createDelivery(c.req.valid("param").id, c.req.valid("json").creator_id);
     return c.json(result.delivery, result.created ? 201 : 200);
   });
 
-  app.get("/deliveries/:id", (c) => c.json(service.getDelivery(c.req.param("id"))));
+  app.get("/deliveries/:id", validate("param", idParam), (c) => c.json(service.getDelivery(c.req.valid("param").id)));
 
-  app.post("/deliveries/:id/approve", (c) => c.json(service.approveDelivery(c.req.param("id"))));
-
-  app.get("/deliveries/:id/events", (c) => c.json(service.listEvents(c.req.param("id"))));
-
-  app.post("/deliveries/:id/pieces/:pieceType/versions", async (c) => {
-    const input = parseVersion(await readBody(c));
-    return c.json(service.submitVersion(c.req.param("id"), c.req.param("pieceType"), input), 201);
-  });
-
-  app.get("/deliveries/:id/pieces/:pieceType/versions", (c) =>
-    c.json(service.listVersions(c.req.param("id"), c.req.param("pieceType"))),
+  app.post("/deliveries/:id/approve", validate("param", idParam), (c) =>
+    c.json(service.approveDelivery(c.req.valid("param").id)),
   );
 
-  app.get("/versions/:id", (c) => c.json(service.getVersion(c.req.param("id"))));
+  app.get("/deliveries/:id/events", validate("param", idParam), validate("query", pageQuery), (c) =>
+    c.json(service.listEvents(c.req.valid("param").id, c.req.valid("query"))),
+  );
 
-  app.post("/versions/:id/approve", (c) => c.json(service.approveVersion(c.req.param("id"))));
+  app.post(
+    "/deliveries/:id/pieces/:pieceType/versions",
+    validate("param", pieceParam),
+    validate("json", newVersionSchema),
+    (c) => {
+      const { id, pieceType } = c.req.valid("param");
+      return c.json(service.submitVersion(id, pieceType, c.req.valid("json")), 201);
+    },
+  );
 
-  app.post("/versions/:id/request-changes", async (c) => {
-    const body = await readBody(c);
-    return c.json(service.requestChanges(c.req.param("id"), optionalString(body, "note") ?? null));
+  app.get("/deliveries/:id/pieces/:pieceType/versions", validate("param", pieceParam), validate("query", pageQuery), (c) => {
+    const { id, pieceType } = c.req.valid("param");
+    return c.json(service.listVersions(id, pieceType, c.req.valid("query")));
   });
 
-  app.post("/versions/:id/comments", async (c) => {
-    const input = parseComment(await readBody(c));
-    return c.json(service.addComment(c.req.param("id"), input), 201);
-  });
+  app.get("/versions/:id", validate("param", idParam), (c) => c.json(service.getVersion(c.req.valid("param").id)));
 
-  app.get("/versions/:id/comments", (c) => c.json(service.listComments(c.req.param("id"))));
+  app.post("/versions/:id/approve", validate("param", idParam), (c) =>
+    c.json(service.approveVersion(c.req.valid("param").id)),
+  );
+
+  app.post("/versions/:id/request-changes", validate("param", idParam), validate("json", requestChangesSchema), (c) =>
+    c.json(service.requestChanges(c.req.valid("param").id, c.req.valid("json").note ?? null)),
+  );
+
+  app.post("/versions/:id/comments", validate("param", idParam), validate("json", newCommentSchema), (c) =>
+    c.json(service.addComment(c.req.valid("param").id, c.req.valid("json")), 201),
+  );
+
+  app.get("/versions/:id/comments", validate("param", idParam), validate("query", pageQuery), (c) =>
+    c.json(service.listComments(c.req.valid("param").id, c.req.valid("query"))),
+  );
 
   return app;
 }
