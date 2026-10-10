@@ -4,6 +4,7 @@ import { HTTPException } from "hono/http-exception";
 import type { DatabaseSync } from "node:sqlite";
 import type { Clock } from "./clock.ts";
 import { AppError } from "./errors.ts";
+import { silentLogger, type Logger } from "./logger.ts";
 import {
   LIMITS,
   idParam,
@@ -23,6 +24,8 @@ export interface AppDeps {
   db: DatabaseSync;
   clock: Clock;
   newId?: () => string;
+  /** Padrão: logger silencioso (testes). O servidor passa o de `createLogger`. */
+  logger?: Logger;
 }
 
 function errorBody(code: string, message: string, details?: Record<string, unknown>) {
@@ -32,6 +35,7 @@ function errorBody(code: string, message: string, details?: Record<string, unkno
 export function createApp(deps: AppDeps) {
   const service = new ReviewService(deps);
   const app = new Hono();
+  const logger = deps.logger ?? silentLogger;
 
   app.onError((err, c) => {
     if (err instanceof AppError) return c.json(errorBody(err.code, err.message, err.details), err.status);
@@ -39,7 +43,7 @@ export function createApp(deps: AppDeps) {
     if (err instanceof HTTPException && err.status === 400) {
       return c.json(errorBody("validacao", "Corpo da requisição não é JSON válido."), 400);
     }
-    console.error(err);
+    logger.error({ err, method: c.req.method, path: c.req.path }, "erro inesperado");
     return c.json(errorBody("erro_interno", "Erro interno."), 500);
   });
 

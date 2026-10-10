@@ -1,11 +1,12 @@
 import { createApp } from "../../src/app.ts";
 import { FixedClock } from "../../src/clock.ts";
 import { openDatabase } from "../../src/db.ts";
+import type { Logger } from "../../src/logger.ts";
 
-export function setup() {
+export function setup(logger?: Logger) {
   const db = openDatabase(":memory:");
   const clock = new FixedClock("2026-03-01T10:00:00.000Z");
-  const app = createApp({ db, clock });
+  const app = createApp({ db, clock, logger });
 
   async function call(method: string, path: string, body?: unknown) {
     const res = await app.request(path, {

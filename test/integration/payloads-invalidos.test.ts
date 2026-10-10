@@ -1,11 +1,13 @@
+import pino from "pino";
 import { describe, expect, it } from "vitest";
+import type { Logger } from "../../src/logger.ts";
 import { setup } from "./helpers.ts";
 
 type T = ReturnType<typeof setup>;
 
 /** Uma campanha, uma entrega, um vídeo v1 e um roteiro v1, para os endpoints que precisam de id válido. */
-async function fixture() {
-  const t = setup();
+async function fixture(logger?: Logger) {
+  const t = setup(logger);
   const d = await t.delivery(["video", "roteiro"]);
   const video = (await t.submit(d.id, "video", { duration_seconds: 30 })).body.version;
   const roteiro = (await t.submit(d.id, "roteiro")).body.version;
@@ -303,18 +305,16 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     expect((await f.t.call("GET", `/versions/${f.videoId}`)).body.status).toBe("em_revisao");
   });
 
-  it("erro inesperado vira 500 JSON genérico, sem stack trace", async () => {
-    const f = await fixture();
+  it("erro inesperado vira 500 JSON genérico, sem stack trace, e o erro vai para o logger", async () => {
+    const lines: string[] = [];
+    const f = await fixture(pino({ level: "info" }, { write: (line: string) => void lines.push(line) }));
     f.t.db.close();
-    const original = console.error;
-    console.error = () => {};
-    try {
-      const res = await f.t.call("GET", `/deliveries/${f.deliveryId}`);
-      expect(res.status).toBe(500);
-      expect(res.body).toEqual({ error: { code: "erro_interno", message: "Erro interno." } });
-      expect(JSON.stringify(res.body)).not.toMatch(/at |\.ts|database/);
-    } finally {
-      console.error = original;
-    }
+    const res = await f.t.call("GET", `/deliveries/${f.deliveryId}`);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: { code: "erro_interno", message: "Erro interno." } });
+    expect(JSON.stringify(res.body)).not.toMatch(/at |\.ts|database/);
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ level: 50, msg: "erro inesperado", method: "GET", path: `/deliveries/${f.deliveryId}`, err: { type: "Error" } });
   });
+
 });

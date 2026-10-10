@@ -16,7 +16,7 @@ npm run typecheck
 npm run load         # sobe a API na porta 3106, roda k6 em Docker e confere as invariantes
 ```
 
-`PORT` e `DB_PATH` mudam porta e arquivo do banco. A stack é Hono, `node:sqlite` sem ORM, zod para validar entrada, vitest, fast-check e k6.
+`PORT` e `DB_PATH` mudam porta e arquivo do banco. Os logs saem em JSON pelo pino, com transporte em worker thread (`pino/file` no stdout), e `LOG_LEVEL` muda o nível (padrão `info`; nos testes o logger é silencioso). A stack é Hono, `node:sqlite` sem ORM, zod para validar entrada, vitest, fast-check e k6.
 
 ## Modelo
 
