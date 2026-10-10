@@ -157,11 +157,24 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
     expectError(res, 413);
   });
 
-  it("campos extras são ignorados", async () => {
+  it("campo desconhecido no corpo é recusado com 400 e o nome do campo nos detalhes", async () => {
     const t = setup();
     const res = await raw(t, "/campaigns", JSON.stringify({ name: "x", required_pieces: ["video"], admin: true, status: "aprovada" }));
-    expect(res.status).toBe(201);
-    expect(res.json).not.toHaveProperty("admin");
+    expectError(res, 400);
+    expect(res.json.error.code).toBe("validacao");
+    expect(res.json.error.details.issues).toEqual([
+      { path: "admin", message: "campo não aceito" },
+      { path: "status", message: "campo não aceito" },
+    ]);
+  });
+
+  it.each(ENDPOINTS)("%s recusa __proto__ no corpo", async (_name, path) => {
+    const f = await fixture();
+    // JSON.parse cria "__proto__" como chave própria; o schema strict tem que enxergá-la.
+    const res = await raw(f.t, path(f), '{"__proto__": {"status": "aprovada"}}');
+    expectError(res, 400);
+    expect(res.json.error.details.issues).toContainEqual({ path: "__proto__", message: "campo não aceito" });
+    expect(({} as Record<string, unknown>).status).toBeUndefined();
   });
 
   it.each(ENDPOINTS)("%s sem Content-Type JSON devolve 415", async (_name, path) => {

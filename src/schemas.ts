@@ -1,5 +1,6 @@
 // Todo dado que vem do cliente (corpo, params, query) passa por um destes schemas.
-// Objetos usam strip: campo desconhecido é descartado sem erro.
+// Corpos usam strict: campo desconhecido (inclusive __proto__) é recusado com 400. Params e query
+// usam strip, porque a query pode carregar parâmetros que não são da API.
 import { zValidator } from "@hono/zod-validator";
 import type { MiddlewareHandler, ValidationTargets } from "hono";
 import { z } from "zod";
@@ -83,18 +84,22 @@ export const pageQuery = z.object({
 
 // ---------- corpos ----------
 
-export const newCampaignSchema = z.object({
-  name: text(200),
-  required_pieces: z.array(z.string().trim().min(1).max(40)).min(1).max(LIMITS.requiredPieces),
-});
+export const newCampaignSchema = z
+  .object({
+    name: text(200),
+    required_pieces: z.array(z.string().trim().min(1).max(40)).min(1).max(LIMITS.requiredPieces),
+  })
+  .strict();
 export type NewCampaign = z.infer<typeof newCampaignSchema>;
 
-export const newDeliverySchema = z.object({
-  creator_id: z
-    .string()
-    .trim()
-    .regex(/^[A-Za-z0-9._:@-]{1,100}$/, "aceita só letras sem acento, números e . _ : @ - (até 100 caracteres)"),
-});
+export const newDeliverySchema = z
+  .object({
+    creator_id: z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9._:@-]{1,100}$/, "aceita só letras sem acento, números e . _ : @ - (até 100 caracteres)"),
+  })
+  .strict();
 
 export const newVersionSchema = z
   .object({
@@ -102,20 +107,23 @@ export const newVersionSchema = z
     file_name: optionalText(255),
     duration_seconds: optionalNumber(0, LIMITS.maxDurationSeconds, true),
   })
+  .strict()
   .refine((v) => (v.url === undefined) !== (v.file_name === undefined), {
     message: "informe exatamente um entre url e file_name",
     path: ["url"],
   });
 export type NewVersion = z.infer<typeof newVersionSchema>;
 
-export const newCommentSchema = z.object({
-  author: text(200),
-  body: text(2000),
-  at_second: optionalNumber(-Infinity, Number.MAX_VALUE),
-});
+export const newCommentSchema = z
+  .object({
+    author: text(200),
+    body: text(2000),
+    at_second: optionalNumber(-Infinity, Number.MAX_VALUE),
+  })
+  .strict();
 export type NewComment = z.infer<typeof newCommentSchema>;
 
-export const requestChangesSchema = z.object({ note: optionalText(2000) });
+export const requestChangesSchema = z.object({ note: optionalText(2000) }).strict();
 
 // ---------- validador ----------
 
@@ -135,7 +143,14 @@ export function requireJson(options: { bodyOptional?: boolean } = {}): Middlewar
 }
 
 export function toValidationError(error: z.ZodError): AppError {
-  const issues = error.issues.map((i) => ({ path: i.path.join(".") || "(corpo)", message: i.message }));
+  const issues = error.issues.flatMap((i) => {
+    const base = i.path.join(".");
+    // Um issue de chaves desconhecidas vira uma linha por campo, para o cliente saber qual tirar.
+    if (i.code === z.ZodIssueCode.unrecognized_keys) {
+      return i.keys.map((k) => ({ path: base ? `${base}.${k}` : k, message: "campo não aceito" }));
+    }
+    return [{ path: base || "(corpo)", message: i.message }];
+  });
   return new AppError(400, "validacao", issues.map((i) => `${i.path}: ${i.message}`).join("; ") + ".", { issues });
 }
 
