@@ -4,12 +4,12 @@ Escrevi este documento antes do código. Ele fixa o modelo, os estados, as invar
 
 ## Vocabulário
 
-- **Campanha**: o que a marca comprou. Declara a lista de peças exigidas.
-- **Tipo de peça**: catálogo fixo (`roteiro`, `video`, `capa`, `legenda`). Cada tipo diz se tem duração (`timed`). Só `video` tem.
-- **Entrega**: o trabalho de um criador numa campanha. Uma por par (campanha, criador).
-- **Versão**: um envio de uma peça dentro de uma entrega. Numerada a partir de 1 por (entrega, peça). A de maior número é a **versão atual**.
-- **Comentário**: nota de revisão presa a uma versão. Em versão com duração, ancorado num segundo.
-- **Evento**: histórico append-only da entrega. Os eventos `delivery.approved` e `delivery.approval_revoked` são os que um serviço de pagamento consumiria (outbox).
+- Campanha: o que a marca comprou. Declara a lista de peças exigidas.
+- Tipo de peça: catálogo fixo (`roteiro`, `video`, `capa`, `legenda`). Cada tipo diz se tem duração (`timed`). Só `video` tem.
+- Entrega: o trabalho de um criador numa campanha. Uma por par (campanha, criador).
+- Versão: um envio de uma peça dentro de uma entrega. Numerada a partir de 1 por (entrega, peça). A de maior número é a versão atual.
+- Comentário: nota de revisão presa a uma versão. Em versão com duração, ancorado num segundo.
+- Evento: histórico append-only da entrega. Os eventos `delivery.approved` e `delivery.approval_revoked` são os que um serviço de pagamento consumiria (outbox).
 
 ## Tabelas
 
@@ -54,25 +54,25 @@ stateDiagram-v2
 
 ## Invariantes
 
-1. **I1**: entrega `aprovada` implica que toda peça exigida tem versão atual com status `aprovada`.
-2. **I2**: números de versão por (entrega, peça) são 1..n, sem buraco nem repetição. Garantido por `UNIQUE` e por calcular `max+1` dentro da mesma transação.
-3. **I3**: no máximo um `delivery.approved` por rodada de aprovação. `approval_round` incrementa a cada aprovação e o índice único parcial impede repetir a rodada.
-4. **I4**: para cada entrega, `#approved - #revoked` é 1 se ela está aprovada e 0 se não está.
-5. **I5**: comentário pertence a uma versão e nunca muda de versão. `at_second` fica entre 0 e `duration_seconds` daquela versão.
-6. **I6**: conteúdo da versão (url, arquivo, duração, número) é imutável. Só o status de revisão muda, e só uma vez.
-7. **I7**: `required_pieces` de uma campanha não muda depois de criada (não há endpoint de edição). Se mudasse, I1 poderia quebrar sem nenhuma versão nova.
+1. I1: entrega `aprovada` implica que toda peça exigida tem versão atual com status `aprovada`.
+2. I2: números de versão por (entrega, peça) são 1..n, sem buraco nem repetição. Garantido por `UNIQUE` e por calcular `max+1` dentro da mesma transação.
+3. I3: no máximo um `delivery.approved` por rodada de aprovação. `approval_round` incrementa a cada aprovação e o índice único parcial impede repetir a rodada.
+4. I4: para cada entrega, `#approved - #revoked` é 1 se ela está aprovada e 0 se não está.
+5. I5: comentário pertence a uma versão e nunca muda de versão. `at_second` fica entre 0 e `duration_seconds` daquela versão.
+6. I6: conteúdo da versão (url, arquivo, duração, número) é imutável. Só o status de revisão muda, e só uma vez.
+7. I7: `required_pieces` de uma campanha não muda depois de criada (não há endpoint de edição). Se mudasse, I1 poderia quebrar sem nenhuma versão nova.
 
 ## Decisões
 
-- **Aprovação da entrega é um ato explícito** (`POST /deliveries/:id/approve`). Ela libera pagamento, então quero que alguém peça. O endpoint recalcula a regra a partir das versões atuais; o status gravado é consequência dessa checagem, nunca um campo que o cliente escreve.
-- **Pendência gera 422 `pecas_pendentes`** com `details.pending`, uma linha por peça exigida que falta, com o motivo `sem_versao` ou `versao_atual_nao_aprovada` (este último traz número e status da versão atual).
-- **Reaprovar entrega já aprovada** devolve 200 com o estado atual e não emite evento novo.
-- **Versão nova numa peça exigida de entrega aprovada** volta a entrega para `em_producao`, zera `approved_at` e grava `delivery.approval_revoked` com a mesma rodada da aprovação desfeita. Para voltar a `aprovada` é preciso aprovar a versão nova e chamar `approve` de novo, o que abre a rodada seguinte e emite outro `delivery.approved`.
-- **Versão nova numa peça não exigida não desfaz a aprovação.** Peça não exigida não bloqueia a aprovação, então desfazer por causa dela abriria uma reaprovação que passaria sem olhar a versão nova. Fica registrado o evento `version.submitted`, como qualquer envio.
-- **`payable`** é `status === 'aprovada'`, exposto no GET da entrega.
-- **Aprovar ou pedir alteração numa versão que não é a atual** devolve 409 `versao_desatualizada`, com o número da versão atual em `details`. O id da versão é o "expected version": o cliente aprova exatamente o que viu.
-- **Comentário não migra.** Comentários são listados por `version_id`. Versão nova começa com lista vazia, e a antiga continua com os dela. Comentar versão antiga é permitido (é histórico de revisão, não decisão).
-- **Peça desconhecida** (fora de `piece_types`) é 400 `tipo_de_peca_desconhecido`, tanto na campanha quanto no envio.
+- Aprovação da entrega é um ato explícito (`POST /deliveries/:id/approve`). Ela libera pagamento, então quero que alguém peça. O endpoint recalcula a regra a partir das versões atuais; o status gravado é consequência dessa checagem, nunca um campo que o cliente escreve.
+- Pendência gera 422 `pecas_pendentes` com `details.pending`, uma linha por peça exigida que falta, com o motivo `sem_versao` ou `versao_atual_nao_aprovada` (este último traz número e status da versão atual).
+- Reaprovar entrega já aprovada devolve 200 com o estado atual e não emite evento novo.
+- Versão nova numa peça exigida de entrega aprovada volta a entrega para `em_producao`, zera `approved_at` e grava `delivery.approval_revoked` com a mesma rodada da aprovação desfeita. Para voltar a `aprovada` é preciso aprovar a versão nova e chamar `approve` de novo, o que abre a rodada seguinte e emite outro `delivery.approved`.
+- Versão nova numa peça não exigida não desfaz a aprovação. Peça não exigida não bloqueia a aprovação, então desfazer por causa dela abriria uma reaprovação que passaria sem olhar a versão nova. Fica registrado o evento `version.submitted`, como qualquer envio.
+- `payable` é `status === 'aprovada'`, exposto no GET da entrega.
+- Aprovar ou pedir alteração numa versão que não é a atual devolve 409 `versao_desatualizada`, com o número da versão atual em `details`. O id da versão é o "expected version": o cliente aprova exatamente o que viu.
+- Comentário não migra. Comentários são listados por `version_id`. Versão nova começa com lista vazia, e a antiga continua com os dela. Comentar versão antiga é permitido (é histórico de revisão, não decisão).
+- Peça desconhecida (fora de `piece_types`) é 400 `tipo_de_peca_desconhecido`, tanto na campanha quanto no envio.
 
 ## Concorrência
 
