@@ -48,14 +48,6 @@ CREATE TABLE IF NOT EXISTS piece_versions (
   UNIQUE (delivery_id, piece_type, number)
 );
 
--- Peça não exigida que recebeu versão nova com a entrega aprovada passa a bloquear a reaprovação.
-CREATE TABLE IF NOT EXISTS delivery_changed_pieces (
-  delivery_id TEXT NOT NULL REFERENCES deliveries(id),
-  piece_type  TEXT NOT NULL REFERENCES piece_types(code),
-  created_at  TEXT NOT NULL,
-  PRIMARY KEY (delivery_id, piece_type)
-);
-
 CREATE TABLE IF NOT EXISTS comments (
   id         TEXT PRIMARY KEY,
   version_id TEXT NOT NULL REFERENCES piece_versions(id),
@@ -225,25 +217,6 @@ export class Repository {
     return this.db.prepare("SELECT * FROM deliveries WHERE campaign_id = ? AND creator_id = ?").get(campaignId, creatorId) as
       | DeliveryRow
       | undefined;
-  }
-
-  markPieceChangedAfterApproval(deliveryId: string, pieceType: string, at: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO delivery_changed_pieces (delivery_id, piece_type, created_at) VALUES (?, ?, ?)
-         ON CONFLICT (delivery_id, piece_type) DO NOTHING`,
-      )
-      .run(deliveryId, pieceType, at);
-  }
-
-  piecesChangedAfterApproval(deliveryId: string): string[] {
-    const rows = this.db
-      .prepare(
-        `SELECT c.piece_type FROM delivery_changed_pieces c JOIN piece_types t ON t.code = c.piece_type
-         WHERE c.delivery_id = ? ORDER BY t.rowid`,
-      )
-      .all(deliveryId) as { piece_type: string }[];
-    return rows.map((r) => r.piece_type);
   }
 
   markDeliveryApproved(id: string, round: number, at: string): void {

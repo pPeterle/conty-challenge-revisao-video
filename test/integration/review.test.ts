@@ -51,17 +51,17 @@ describe("regra de peças exigidas", () => {
     expect(res.status).toBe(422);
     expect(res.body.error.code).toBe("pecas_pendentes");
     expect(res.body.error.message).toBe(
-      "A entrega não pode ser aprovada. Peças pendentes: roteiro: nenhuma versão enviada; capa: versão atual v1 com alteração solicitada; legenda: versão atual v1 em revisão.",
+      "A entrega não pode ser aprovada. Peças exigidas pendentes: roteiro: nenhuma versão enviada; capa: versão atual v1 com alteração solicitada; legenda: versão atual v1 em revisão.",
     );
     expect(res.body.error.details.pending).toEqual([
-      { piece_type: "roteiro", required: true, reason: "sem_versao" },
+      { piece_type: "roteiro", reason: "sem_versao" },
       {
         piece_type: "capa",
-        required: true,
+       
         reason: "versao_atual_nao_aprovada",
         current_version: { id: capa.body.version.id, number: 1, status: "alteracao_solicitada" },
       },
-      { piece_type: "legenda", required: true, reason: "versao_atual_nao_aprovada", current_version: expect.objectContaining({ number: 1, status: "em_revisao" }) },
+      { piece_type: "legenda", reason: "versao_atual_nao_aprovada", current_version: expect.objectContaining({ number: 1, status: "em_revisao" }) },
     ]);
 
     const after = await t.call("GET", `/deliveries/${d.id}`);
@@ -97,7 +97,7 @@ describe("regra de peças exigidas", () => {
   it("campanha só de vídeo não exige roteiro", async () => {
     const t = setup();
     const d = await t.delivery(["video"]);
-    expect(d.pending).toEqual([{ piece_type: "video", required: true, reason: "sem_versao" }]);
+    expect(d.pending).toEqual([{ piece_type: "video", reason: "sem_versao" }]);
     await t.submitAndApprove(d.id, "video");
     const res = await t.call("POST", `/deliveries/${d.id}/approve`);
     expect(res.status).toBe(200);
@@ -116,7 +116,7 @@ describe("regra de peças exigidas", () => {
     const res = await t.call("POST", `/deliveries/${d.id}/approve`);
     expect(res.status).toBe(200);
     const roteiroPiece = res.body.delivery.pieces.find((p: { piece_type: string }) => p.piece_type === "roteiro");
-    expect(roteiroPiece).toMatchObject({ required: false, current_version: { status: "alteracao_solicitada" } });
+    expect(roteiroPiece).toMatchObject({ current_version: { status: "alteracao_solicitada" } });
   });
 
   it("aprovar entrega já aprovada é idempotente e não emite segundo evento", async () => {
@@ -214,7 +214,7 @@ describe("entrega aprovada que recebe versão nova", () => {
     expect(blocked.body.error.details.pending).toEqual([
       {
         piece_type: "video",
-        required: true,
+       
         reason: "versao_atual_nao_aprovada",
         current_version: { id: v2.body.version.id, number: 2, status: "em_revisao" },
       },
@@ -269,30 +269,43 @@ describe("entrega aprovada que recebe versão nova", () => {
     expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
   });
 
-  it("versão nova em peça não exigida também desfaz a aprovação e passa a bloquear até ser aprovada", async () => {
+  it("versão nova em peça não exigida não desfaz nem bloqueia a entrega aprovada", async () => {
     const t = setup();
     const d = await t.delivery(["video"]);
     await t.submitAndApprove(d.id, "video");
     await t.call("POST", `/deliveries/${d.id}/approve`);
 
-    const extra = await t.submit(d.id, "legenda");
-    expect(extra.body.approval_revoked).toBe(true);
-    expect(extra.body.delivery).toMatchObject({ status: "em_producao", payable: false, blocking_pieces: ["video", "legenda"] });
+    const legenda = await t.submit(d.id, "legenda");
+    expect(legenda.body.approval_revoked).toBe(false);
+    expect(legenda.body.delivery).toMatchObject({ status: "aprovada", payable: true, approval_round: 1 });
+    const changes = await t.call("POST", `/versions/${legenda.body.version.id}/request-changes`, { note: "erro de digitação" });
+    expect(changes.status).toBe(200);
 
-    const blocked = await t.call("POST", `/deliveries/${d.id}/approve`);
-    expect(blocked.status).toBe(422);
-    expect(blocked.body.error.details.pending).toEqual([
-      {
-        piece_type: "legenda",
-        required: false,
-        reason: "versao_atual_nao_aprovada",
-        current_version: { id: extra.body.version.id, number: 1, status: "em_revisao" },
-      },
-    ]);
-    expect(blocked.body.error.message).toContain("legenda (não exigida, mudou depois da aprovação)");
+    const again = await t.call("POST", `/deliveries/${d.id}/approve`);
+    expect(again.status).toBe(200);
+    expect(again.body).toMatchObject({ already_approved: true, delivery: { status: "aprovada", pending: [] } });
+    const events = (await t.call("GET", `/deliveries/${d.id}/events`)).body as { type: string }[];
+    expect(events.filter((e) => e.type === "delivery.approval_revoked")).toHaveLength(0);
+  });
 
-    await t.call("POST", `/versions/${extra.body.version.id}/approve`);
-    expect((await t.call("GET", `/deliveries/${d.id}`)).body).toMatchObject({ status: "aprovada", approval_round: 2 });
+  it("roteiro enviado depois em campanha só de vídeo não desfaz nem bloqueia, e a ordem dos envios não importa", async () => {
+    const t = setup();
+    // Ordem 1: roteiro chega e é recusado depois da aprovação.
+    const late = await t.delivery(["video"], "criador-a");
+    await t.submitAndApprove(late.id, "video");
+    await t.call("POST", `/deliveries/${late.id}/approve`);
+    const roteiro = await t.submit(late.id, "roteiro");
+    await t.call("POST", `/versions/${roteiro.body.version.id}/request-changes`);
+    expect((await t.call("GET", `/deliveries/${late.id}`)).body).toMatchObject({ status: "aprovada", pending: [] });
+
+    // Ordem 2: roteiro chega e é recusado antes da aprovação.
+    const early = await t.delivery(["video"], "criador-b");
+    const roteiroAntes = await t.submit(early.id, "roteiro");
+    await t.call("POST", `/versions/${roteiroAntes.body.version.id}/request-changes`);
+    await t.submitAndApprove(early.id, "video");
+    const res = await t.call("POST", `/deliveries/${early.id}/approve`);
+    expect(res.status).toBe(200);
+    expect(res.body.delivery.status).toBe("aprovada");
   });
 
   it("primeira aprovação continua explícita: aprovar a última peça não aprova a entrega sozinha", async () => {

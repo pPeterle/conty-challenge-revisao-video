@@ -3,7 +3,6 @@ import type { DatabaseSync } from "node:sqlite";
 import type { Clock } from "./clock.ts";
 import { Repository, transaction, type Page, type CommentRow, type DeliveryRow, type EventRow, type VersionRow } from "./db.ts";
 import {
-  blockingPieces,
   describePending,
   isValidAtSecond,
   pendingPieces,
@@ -163,15 +162,13 @@ export class ReviewService {
         number: version.number,
       });
 
-      const revoked = submissionRevokesApproval(delivery.status);
+      const required = this.repo.requiredPieces(delivery.campaign_id);
+      const revoked = submissionRevokesApproval(delivery.status, pieceType, required);
       if (revoked) {
-        const required = this.repo.requiredPieces(delivery.campaign_id).includes(pieceType);
-        if (!required) this.repo.markPieceChangedAfterApproval(delivery.id, pieceType, now);
         this.repo.markDeliveryInProduction(delivery.id);
         this.event(delivery.id, "delivery.approval_revoked", delivery.approval_round, {
           reason: "nova_versao",
           piece_type: pieceType,
-          required,
           version_id: version.id,
           number: version.number,
         });
@@ -286,18 +283,17 @@ export class ReviewService {
 
   private evaluate(delivery: DeliveryRow) {
     const required = this.repo.requiredPieces(delivery.campaign_id);
-    const changed = this.repo.piecesChangedAfterApproval(delivery.id);
     const current = this.currentByPiece(delivery.id);
-    return { required, changed, current, pending: pendingPieces(required, changed, current) };
+    return { required, current, pending: pendingPieces(required, current) };
   }
 
   private markApproved(delivery: DeliveryRow, automatic: boolean) {
-    const { required, changed, current } = this.evaluate(delivery);
+    const { required, current } = this.evaluate(delivery);
     const round = delivery.approval_round + 1;
     this.repo.markDeliveryApproved(delivery.id, round, this.now());
     this.event(delivery.id, "delivery.approved", round, {
       automatic,
-      versions: blockingPieces(required, changed).map((p) => ({
+      versions: required.map((p) => ({
         piece_type: p,
         version_id: current.get(p)!.id,
         number: current.get(p)!.number,
@@ -327,10 +323,9 @@ export class ReviewService {
   }
 
   private deliveryView(delivery: DeliveryRow) {
-    const { required, changed, current, pending } = this.evaluate(delivery);
-    const blocking = blockingPieces(required, changed);
+    const { required, current, pending } = this.evaluate(delivery);
     const counts = this.repo.versionCounts(delivery.id);
-    const pieceTypes = [...blocking, ...[...current.keys()].filter((p) => !blocking.includes(p)).sort()];
+    const pieceTypes = [...required, ...[...current.keys()].filter((p) => !required.includes(p)).sort()];
     return {
       id: delivery.id,
       campaign_id: delivery.campaign_id,
@@ -341,7 +336,6 @@ export class ReviewService {
       approved_at: delivery.approved_at,
       created_at: delivery.created_at,
       required_pieces: required,
-      blocking_pieces: blocking,
       ready_to_approve: pending.length === 0,
       pending,
       pieces: pieceTypes.map((p) => {
@@ -349,7 +343,6 @@ export class ReviewService {
         return {
           piece_type: p,
           required: required.includes(p),
-          blocking: blocking.includes(p),
           versions_count: counts.get(p) ?? 0,
           current_version: v ? toVersionJson(v, true) : null,
         };

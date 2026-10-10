@@ -251,7 +251,7 @@ describe("payloads inválidos não derrubam a API nem gravam nada", () => {
 
   it("nenhum payload inválido grava nada no banco", async () => {
     const f = await fixture();
-    const tables = ["campaigns", "campaign_required_pieces", "deliveries", "piece_versions", "comments", "delivery_events", "delivery_changed_pieces"];
+    const tables = ["campaigns", "campaign_required_pieces", "deliveries", "piece_versions", "comments", "delivery_events"];
     const snapshot = () => tables.map((tb) => (f.t.db.prepare(`SELECT COUNT(*) AS n FROM ${tb}`).get() as { n: number }).n);
     const before = snapshot();
 
