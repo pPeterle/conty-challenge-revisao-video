@@ -8,12 +8,13 @@ const BASE = __ENV.BASE_URL || "http://localhost:3106";
 const JSON_HEADERS = { headers: { "content-type": "application/json" } };
 const PIECES = ["roteiro", "video", "capa", "legenda"];
 
-http.setResponseCallback(http.expectedStatuses(200, 201, 409, 422));
+http.setResponseCallback(http.expectedStatuses(200, 201, 400, 404, 409, 413, 422));
 
 const deliveriesApproved = new Counter("deliveries_approved");
 const approvalsRevoked = new Counter("approvals_revoked");
 const staleApprovals = new Counter("stale_version_approvals");
 const blockedApprovals = new Counter("blocked_delivery_approvals");
+const invalidPayloads = new Counter("invalid_payloads_sent");
 
 export const options = {
   scenarios: {
@@ -34,8 +35,17 @@ export const options = {
   },
 };
 
-function post(path, body) {
-  return http.post(`${BASE}${path}`, JSON.stringify(body ?? {}), JSON_HEADERS);
+// Agrupa URLs com id numa tag só, para o k6 não criar uma série de métricas por entrega/versão.
+function named(path) {
+  return { tags: { name: path.replace(/[0-9a-f]{8}-[0-9a-f-]{27}/g, ":id").split("?")[0] } };
+}
+
+function get(path) {
+  return http.get(`${BASE}${path}`, named(path));
+}
+
+function post(path, body, raw = false, headers = JSON_HEADERS.headers) {
+  return http.post(`${BASE}${path}`, raw ? body : JSON.stringify(body ?? {}), { headers, ...named(path) });
 }
 
 export function setup() {
@@ -66,7 +76,7 @@ function submitVersion(deliveryId) {
 }
 
 function reviewCurrent(deliveryId) {
-  const view = http.get(`${BASE}/deliveries/${deliveryId}`);
+  const view = get(`/deliveries/${deliveryId}`);
   check(view, { "GET entrega: 200": (r) => r.status === 200 });
   if (view.status !== 200) return;
   const inReview = view.json("pieces").filter((p) => p.current_version && p.current_version.status === "em_revisao");
@@ -92,7 +102,7 @@ function approveDelivery(deliveryId) {
 }
 
 function comment(deliveryId) {
-  const view = http.get(`${BASE}/deliveries/${deliveryId}`);
+  const view = get(`/deliveries/${deliveryId}`);
   if (view.status !== 200) return;
   const video = view.json("pieces").find((p) => p.piece_type === "video" && p.current_version);
   if (!video) return;
@@ -105,11 +115,50 @@ function comment(deliveryId) {
   check(res, { "comentário: 201": (r) => r.status === 201 });
 }
 
+// Payloads que um cliente mal comportado mandaria. A resposta tem que ser 4xx, nunca 5xx.
+const GARBAGE = [
+  "{nope",
+  "null",
+  "[1,2,3]",
+  '"texto"',
+  "{}",
+  '{"url": 5, "duration_seconds": "dez"}',
+  '{"url": "javascript:alert(1)", "duration_seconds": 10}',
+  '{"file_name": "", "duration_seconds": -1}',
+  '{"duration_seconds": 1e309}',
+  '{"author": 1, "body": [], "at_second": "x"}',
+  '{"author": "m", "body": "x", "at_second": 99999}',
+  '{"name": "   ", "required_pieces": {"video": true}}',
+  '{"creator_id": "joão da silva"}',
+  '{"note": 12}',
+];
+
+function invalidRequest(deliveryId) {
+  invalidPayloads.add(1);
+  const paths = [
+    "/campaigns",
+    `/deliveries/${deliveryId}/pieces/${pick(PIECES)}/versions`,
+    `/deliveries/${deliveryId}/pieces/trilha/versions`,
+    `/deliveries/${deliveryId}/approve?x=1`,
+    "/versions/nao-existe/comments",
+    "/versions/%F0%9F%92%A5/approve",
+    `/deliveries/${deliveryId}/events?limit=-1`,
+  ];
+  const path = pick(paths);
+  const res = path.includes("events") ? get(path) : post(path, pick(GARBAGE), true, Math.random() < 0.8 ? JSON_HEADERS.headers : {});
+  check(res, {
+    "payload inválido: nunca 5xx": (r) => r.status < 500,
+    "payload inválido: erro no formato padrão": (r) =>
+      r.status < 400 || (typeof r.json("error.code") === "string" && typeof r.json("error.message") === "string"),
+  });
+}
+
 export default function (data) {
   const deliveryId = pick(data.deliveries);
   const roll = Math.random();
-  if (roll < 0.3) submitVersion(deliveryId);
-  else if (roll < 0.7) reviewCurrent(deliveryId);
-  else if (roll < 0.92) approveDelivery(deliveryId);
+  if (roll < 0.1) invalidRequest(deliveryId);
+  else if (roll < 0.37) submitVersion(deliveryId);
+  else if (roll < 0.72) reviewCurrent(deliveryId);
+  else if (roll < 0.93) approveDelivery(deliveryId);
   else comment(deliveryId);
 }

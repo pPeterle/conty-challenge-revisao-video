@@ -10,14 +10,33 @@ const db = new DatabaseSync(path, { readOnly: true });
 const failures: string[] = [];
 const all = <T>(sql: string) => db.prepare(sql).all() as T[];
 
-// I1: entrega aprovada => toda peça exigida tem versão atual aprovada.
+// Peças que bloqueiam cada entrega: as exigidas pela campanha e as não exigidas que mudaram
+// depois de uma aprovação.
+const BLOCKING = `
+  SELECT d.id AS delivery_id, r.piece_type FROM deliveries d
+  JOIN campaign_required_pieces r ON r.campaign_id = d.campaign_id
+  UNION
+  SELECT delivery_id, piece_type FROM delivery_changed_pieces`;
+
+// I1: entrega aprovada => toda peça que bloqueia tem versão atual aprovada.
 const brokenApprovals = all<{ id: string; piece_type: string; status: string | null }>(`
   SELECT d.id, r.piece_type, v.status
   FROM deliveries d
-  JOIN campaign_required_pieces r ON r.campaign_id = d.campaign_id
+  JOIN (${BLOCKING}) r ON r.delivery_id = d.id
   LEFT JOIN piece_versions v ON v.delivery_id = d.id AND v.piece_type = r.piece_type
     AND v.number = (SELECT MAX(number) FROM piece_versions WHERE delivery_id = d.id AND piece_type = r.piece_type)
   WHERE d.status = 'aprovada' AND (v.status IS NULL OR v.status <> 'aprovada')`);
+// I8: entrega desfeita (rodada > 0, em produção) sem nenhuma pendência deveria ter voltado a aprovada sozinha.
+const stuck = all<{ id: string }>(`
+  SELECT d.id FROM deliveries d
+  WHERE d.status = 'em_producao' AND d.approval_round > 0
+    AND NOT EXISTS (
+      SELECT 1 FROM (${BLOCKING}) r
+      LEFT JOIN piece_versions v ON v.delivery_id = d.id AND v.piece_type = r.piece_type
+        AND v.number = (SELECT MAX(number) FROM piece_versions WHERE delivery_id = d.id AND piece_type = r.piece_type)
+      WHERE r.delivery_id = d.id AND (v.status IS NULL OR v.status <> 'aprovada'))`);
+for (const s of stuck) failures.push(`entrega ${s.id} desfeita e sem pendência, mas não voltou a aprovada`);
+
 for (const b of brokenApprovals) failures.push(`entrega ${b.id} aprovada com ${b.piece_type} em ${b.status ?? "sem_versao"}`);
 
 // I2: números de versão 1..n por peça, sem repetição nem buraco.
@@ -60,16 +79,21 @@ const summary = {
   comentarios: count("SELECT COUNT(*) AS n FROM comments"),
   eventos_delivery_approved: count("SELECT COUNT(*) AS n FROM delivery_events WHERE type = 'delivery.approved'"),
   eventos_approval_revoked: count("SELECT COUNT(*) AS n FROM delivery_events WHERE type = 'delivery.approval_revoked'"),
+  reaprovacoes_automaticas: count(
+    "SELECT COUNT(*) AS n FROM delivery_events WHERE type = 'delivery.approved' AND json_extract(payload, '$.automatic') = 1",
+  ),
+  pecas_nao_exigidas_que_passaram_a_bloquear: count("SELECT COUNT(*) AS n FROM delivery_changed_pieces"),
 };
 console.log("resumo do banco após a carga:", summary);
 
 // Sem aprovação nem revogação a carga não exercitou a regra; isso também é falha.
 if (summary.eventos_delivery_approved === 0) failures.push("nenhuma entrega foi aprovada durante a carga");
 if (summary.eventos_approval_revoked === 0) failures.push("nenhuma aprovação foi desfeita durante a carga");
+if (summary.reaprovacoes_automaticas === 0) failures.push("nenhuma reaprovação automática aconteceu durante a carga");
 
 if (failures.length > 0) {
   console.error(`FALHOU: ${failures.length} violação(ões)`);
   for (const f of failures.slice(0, 50)) console.error(" -", f);
   process.exit(1);
 }
-console.log("OK: invariantes I1 a I5 valem em todas as entregas.");
+console.log("OK: invariantes I1 a I5 e I8 valem em todas as entregas.");
